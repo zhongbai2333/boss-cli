@@ -20,6 +20,10 @@ dependencies = [
     "httpx>=0.27",
     "browser-cookie3>=0.19",
     "qrcode>=7.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "lxml>=5.3",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +45,7 @@ Issues = "https://github.com/jackwener/boss-cli/issues"
 
 [project.scripts]
 boss = "boss_cli.cli:cli"
+boss-plugin = "boss_cli.plugin_api:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -8,9 +8,11 @@ on:
 
 jobs:
   verify:
+    if: github.repository == 'jackwener/boss-cli'
     uses: ./.github/workflows/ci.yml
 
   publish:
+    if: github.repository == 'jackwener/boss-cli'
     needs: verify
     runs-on: ubuntu-latest
     environment: pypi

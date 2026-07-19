@@ -8,6 +8,12 @@ A CLI for BOSS 直聘 — search jobs, view recommendations, manage applications
 
 [English](#features) | [中文](#功能特性)
 
+## 讯飞星辰 Agent Plugin
+
+本分支提供可部署的 HTTP 自定义插件，将 BOSS 直聘与经授权的中国公共招聘网岗位统一为 Agent 可调用的数据结构。它通过星辰平台的“资源管理 → 自定义插件”接入，不是 MCP 服务。
+
+部署、鉴权、合规边界和参数配置请参阅 [`ASTRON_PLUGIN.md`](./ASTRON_PLUGIN.md)。
+
 ## More Tools
 
 - [xiaohongshu-cli](https://github.com/jackwener/xiaohongshu-cli) — Xiaohongshu CLI for notes, search, and interactions

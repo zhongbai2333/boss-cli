@@ -23,13 +23,9 @@ import sys
 from typing import Any
 
 from .auth import Credential, qr_login, save_credential
-from .constants import BASE_URL
+from .constants import BASE_URL, is_zhipin_cookie_domain
 
 logger = logging.getLogger(__name__)
-
-# Cookie domains to export from browser
-BROWSER_EXPORT_DOMAINS = (".zhipin.com", "zhipin.com", "www.zhipin.com")
-
 
 class BrowserLoginUnavailable(RuntimeError):
     """Raised when the camoufox browser backend cannot be started."""
@@ -71,7 +67,7 @@ def _normalize_browser_cookies(raw_cookies: list[dict[str, Any]]) -> dict[str, s
         domain = entry.get("domain", "")
         if not isinstance(name, str) or not isinstance(value, str):
             continue
-        if not any(domain.endswith(d) for d in BROWSER_EXPORT_DOMAINS):
+        if not is_zhipin_cookie_domain(domain):
             continue
         cookies[name] = value
     return cookies

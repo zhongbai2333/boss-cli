@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from pathlib import Path
 
 import click
 from rich.panel import Panel
@@ -18,10 +20,21 @@ from ._common import (
 logger = logging.getLogger(__name__)
 
 
+def _transfer_passphrase(env_name: str, *, confirm: bool) -> str:
+    """Read a transfer passphrase without accepting it as a CLI argument."""
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    return click.prompt("凭证包密码", hide_input=True, confirmation_prompt=confirm)
+
+
 @click.command()
 @click.option("--qrcode", is_flag=True, help="使用二维码扫码登录")
 @click.option("--cookie-source", default=None, help="指定浏览器 (chrome/firefox/edge/brave/arc/safari等)")
-def login(qrcode: bool, cookie_source: str | None) -> None:
+@click.option("--cdp", is_flag=True, help="使用持久隔离 Chrome 登录并复用实时登录态")
+@click.option("--cdp-port", type=click.IntRange(1, 65535), default=9222, show_default=True, help="Chrome CDP 本机端口")
+@click.option("--login-timeout", type=click.IntRange(1), default=300, show_default=True, help="等待浏览器登录的秒数")
+def login(qrcode: bool, cookie_source: str | None, cdp: bool, cdp_port: int, login_timeout: int) -> None:
     """扫码登录 Boss 直聘 APP"""
     from ..auth import clear_credential, verify_credential
 
@@ -55,7 +68,18 @@ def login(qrcode: bool, cookie_source: str | None) -> None:
             )
         raise SystemExit(1)
 
-    if qrcode:
+    if cdp:
+        from ..cdp_login import CDPLoginUnavailable, cdp_login
+
+        console.print("[cyan]正在打开 BOSS 专用 Chrome，请在浏览器中完成登录…[/cyan]")
+        try:
+            cred = cdp_login(port=cdp_port, timeout=login_timeout)
+        except (CDPLoginUnavailable, RuntimeError) as exc:
+            console.print(f"[red]❌ {exc}[/red]")
+            raise SystemExit(1) from None
+        _finalize_login(cred)
+        console.print("[dim]专用 Chrome 将保持运行，以持续维护登录态。[/dim]")
+    elif qrcode:
         # Prefer browser-assisted login (captures __zp_stoken__ via JS)
         # Fallback to HTTP-only QR flow when camoufox is unavailable
         try:
@@ -127,6 +151,117 @@ def logout() -> None:
     from ..auth import clear_credential
     clear_credential()
     console.print("[green]✅ 已退出登录[/green]")
+
+
+@click.command("config-export")
+@click.argument("output", type=click.Path(path_type=Path, dir_okay=False))
+@click.option("--passphrase-env", default="BOSS_CREDENTIAL_PASSPHRASE", show_default=True, help="读取密码的环境变量名")
+@click.option("--refresh/--no-refresh", default=True, show_default=True, help="导出前刷新浏览器实时登录态")
+@click.option("--force", is_flag=True, help="覆盖已存在的导出文件")
+def config_export(output: Path, passphrase_env: str, refresh: bool, force: bool) -> None:
+    """一键导出登录态和插件配置为加密完整配置包。"""
+    from ..auth import get_credential, refresh_credential
+    from ..config_transfer import collect_portable_settings, export_config_file
+    from ..credential_transfer import CredentialTransferError
+
+    credential = None
+    if refresh:
+        credential, _ = refresh_credential()
+    if credential is None:
+        credential = get_credential()
+    if credential is None:
+        console.print("[red]❌ 没有可导出的登录态，请先执行 boss login[/red]")
+        raise SystemExit(1)
+
+    passphrase = _transfer_passphrase(passphrase_env, confirm=True)
+    try:
+        settings = collect_portable_settings()
+        export_config_file(output, credential, settings, passphrase, overwrite=force)
+    except CredentialTransferError as exc:
+        console.print(f"[red]❌ 导出失败: {exc}[/red]")
+        raise SystemExit(1) from None
+    console.print(f"[green]✅ 已导出加密完整配置包: {output.expanduser()}[/green]")
+    console.print(f"[dim]包含登录态和 {len(settings)} 项可移植配置；不包含缓存、日志或浏览器 Profile。[/dim]")
+    console.print("[yellow]请通过安全通道传输文件，并与密码分开保存。[/yellow]")
+
+
+@click.command("config-import")
+@click.argument("input_file", type=click.Path(path_type=Path, exists=True, dir_okay=False, readable=True))
+@click.option("--passphrase-env", default="BOSS_CREDENTIAL_PASSPHRASE", show_default=True, help="读取密码的环境变量名")
+@click.option("--verify", is_flag=True, help="保存后调用 BOSS 接口验证，失败则恢复原凭证")
+@click.option("--force", is_flag=True, help="无需确认即可覆盖现有登录态和插件配置")
+def config_import(input_file: Path, passphrase_env: str, verify: bool, force: bool) -> None:
+    """一键导入加密配置包；兼容旧版仅凭证包。"""
+    from ..auth import clear_credential, load_credential, save_credential, verify_credential
+    from ..config_transfer import (
+        CONFIG_PACKAGE_FORMAT,
+        import_config_file,
+        read_package_format,
+        write_portable_settings,
+    )
+    from ..constants import PLUGIN_ENV_FILE
+    from ..credential_transfer import CredentialTransferError, import_credential_file
+    from ..io_utils import atomic_write_private
+
+    previous = load_credential()
+    previous_env = PLUGIN_ENV_FILE.read_text(encoding="utf-8") if PLUGIN_ENV_FILE.exists() else None
+    if (previous is not None or previous_env is not None) and not force:
+        click.confirm("本地已有登录态或插件配置，是否覆盖？", abort=True)
+
+    passphrase = _transfer_passphrase(passphrase_env, confirm=False)
+    try:
+        package_format = read_package_format(input_file)
+        if package_format == CONFIG_PACKAGE_FORMAT:
+            bundle = import_config_file(input_file, passphrase)
+            credential = bundle.credential
+            settings = bundle.settings
+        else:
+            credential = import_credential_file(input_file, passphrase)
+            settings = None
+    except CredentialTransferError as exc:
+        console.print(f"[red]❌ 导入失败: {exc}[/red]")
+        raise SystemExit(1) from None
+
+    try:
+        save_credential(credential)
+        if settings is not None:
+            write_portable_settings(settings, PLUGIN_ENV_FILE)
+        if verify:
+            authenticated, reason = verify_credential(credential, force_refresh=True)
+            if not authenticated:
+                raise CredentialTransferError(reason or "导入登录态未通过在线验证")
+    except Exception as exc:
+        try:
+            if previous is not None:
+                save_credential(previous)
+            else:
+                clear_credential()
+            if previous_env is not None:
+                atomic_write_private(PLUGIN_ENV_FILE, previous_env)
+            else:
+                PLUGIN_ENV_FILE.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to roll back imported configuration")
+        console.print("[red]❌ 导入配置失败，已恢复原登录态和插件配置[/red]")
+        console.print(f"[dim]{exc}[/dim]")
+        raise SystemExit(1) from None
+
+    if settings is None:
+        console.print(f"[green]✅ 已导入旧版登录态[/green] ({len(credential.cookies)} cookies)")
+    else:
+        console.print(
+            f"[green]✅ 已导入完整配置[/green] "
+            f"({len(credential.cookies)} cookies, {len(settings)} 项插件配置)"
+        )
+        console.print("[yellow]请重启 boss-plugin 或容器，使新配置全部生效。[/yellow]")
+    if not verify:
+        console.print("[dim]尚未在线验证，可运行 boss status 或导入时添加 --verify。[/dim]")
+
+
+# Backward-compatible command object aliases. New documentation should use
+# config-export/config-import, while existing scripts keep working unchanged.
+credential_export = config_export
+credential_import = config_import
 
 
 @click.command()

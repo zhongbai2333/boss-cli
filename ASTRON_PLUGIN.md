@@ -15,10 +15,105 @@
 复制 `.env.example` 为 `.env`，然后配置：
 
 - `MOHRSS_AUTHORIZED=true`：仅在项目已取得书面授权时设置。
-- `PLUGIN_API_KEY`：生成一个随机密钥，用于星辰 Service/Header 鉴权。
+- `PLUGIN_API_KEY`：必填。生成一个随机密钥，用于星辰 Service/Header 鉴权；未设置时业务接口默认返回 `503`。
 - `BOSS_COOKIES`：BOSS 登录 Cookie；不使用 BOSS 来源时可留空。
+- `BOSS_PLUGIN_CACHE_TTL_S=1800`：BOSS 查询的 SQLite 缓存有效期，默认 30 分钟，代码强制最低 60 秒。
+- `BOSS_PLUGIN_MIN_INTERVAL_S=10`：缓存未命中时，BOSS 回源请求的最小间隔，默认 10 秒，代码强制最低 5 秒。
+- `PUBLIC_PLUGIN_CACHE_TTL_S=1800`：中国公共招聘网的独立 SQLite 缓存有效期，默认 30 分钟。
+- `PUBLIC_PLUGIN_MIN_INTERVAL_S=2`：中国公共招聘网的独立跨进程回源间隔，默认 2 秒，最低 1 秒。
+- `LLM_SEMANTIC_CACHE_ENABLED=false`：是否启用 LLM 语义缓存别名；默认关闭。
+- `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`：OpenAI-compatible `/chat/completions` 服务配置。
+- `LLM_SEMANTIC_CONFIDENCE=0.92`：接受语义别名的最低置信度。
+- `LLM_SEMANTIC_ALIAS_TTL_S=604800`：语义别名缓存时间，默认 7 天。
+- `LLM_TIMEOUT_S=5`：单次语义规划超时，限制为 1–15 秒且不自动重试。
 
-本地安装后运行 `boss-plugin`，默认监听 `0.0.0.0:8000`。也可使用仓库的 `Dockerfile` 与 `compose.yaml` 部署。
+本地安装后运行 `boss-plugin`，默认只监听 `127.0.0.1:8000`。仅本机开发且明确不需要鉴权时，可设置 `PLUGIN_ALLOW_ANONYMOUS=true`；不要在公网、局域网或容器生产部署中启用该开关。容器入口会显式监听 `0.0.0.0:8000`，仓库的 Compose 默认只映射到宿主机 `127.0.0.1:8000`。
+
+### 从本地一键迁移完整配置
+
+如果云端不方便直接登录和逐项配置，可以先在本地完成 Chrome 登录与插件调试，确认可用后导出一个加密完整配置包：
+
+```bash
+boss login --cdp
+boss status
+boss config-export boss-cloud.bossconfig
+```
+
+导出包包含：
+
+- BOSS 登录 Cookie。
+- 插件 API Key 与监听参数。
+- 各数据平台的授权开关、缓存 TTL 和限流参数。
+- LLM 语义缓存开关、兼容端点、模型、API Key、阈值、TTL 与超时。
+
+导出包不包含：SQLite 结果缓存、请求预约状态、Chrome Profile、浏览器可执行文件、本地路径、日志、测试数据或导出密码。`BOSS_CREDENTIAL_PASSPHRASE` 永远不会被打包，文件与密码必须分开传输。
+
+将 `boss-cloud.bossconfig` 通过安全通道上传到服务器。直接安装运行时，可执行：
+
+```bash
+boss config-import boss-cloud.bossconfig --verify
+boss status
+# 重启已运行的 boss-plugin，使 plugin.env 中的全部配置生效
+```
+
+使用仓库的 Compose 部署时，`boss-cli-config` 命名卷会同时持久保存导入后的 `credential.json`、`plugin.env` 和 `cache.db`。启动容器后可将配置包复制进去并一键导入：
+
+```bash
+docker compose up -d
+docker compose cp boss-cloud.bossconfig job-plugin:/tmp/boss-cloud.bossconfig
+docker compose exec job-plugin boss config-import /tmp/boss-cloud.bossconfig --force --verify
+docker compose exec job-plugin rm /tmp/boss-cloud.bossconfig
+docker compose restart job-plugin
+```
+
+密码默认以隐藏方式交互输入。无人值守部署应通过密钥管理服务向容器注入 `BOSS_CREDENTIAL_PASSPHRASE`，不要把密码写入命令行、镜像、Compose 文件或 Git。完整配置包使用 Scrypt + AES-256-GCM 加密并认证元数据；导入前会完整解密校验，写入或在线验证失败时同时回滚登录态和插件配置。导入完成后及时删除上传文件。
+
+导入配置写入 `~/.config/boss-cli/plugin.env`。插件启动时会优先加载该受管文件，并覆盖 Compose `env_file` 中同名的可移植配置，确保本地确认过的快照在容器重启后真正一键生效。导出密码等不在白名单内的运行时变量不会被覆盖。若要改回云端环境配置，请重新导入配置包，或删除该文件后重启服务。旧版 `boss credential-export/import` 和仅包含 Cookie 的 `.bosscred` 包继续兼容，但新部署推荐使用 `config-export/import`。
+
+`BOSS_COOKIES` 仍可用于现有部署；如果同时存在环境变量和导入凭证，已保存凭证会先被读取。若需要切换到环境变量方式，请先执行 `boss logout` 清除导入凭证。
+
+### 多平台缓存与限流
+
+星辰 Agent 可能重复调用插件，或并发生成多个相似查询。插件使用同一个 SQLite 缓存引擎，但每个平台拥有独立命名空间、TTL、限流槽和授权规则。目前支持 `boss` 与 `public`，后续新增平台时也应通过独立来源适配器接入，不能共用上游限流状态。
+
+1. 每个来源先读取 `~/.config/boss-cli/cache.db` 中自己的 SQLite 缓存；命中且未过期时不会访问对应上游。
+2. BOSS 缓存键额外包含不可逆账号指纹，不同账号不会串用数据；公共网仍会在读取缓存前检查书面授权开关。
+3. `source=all` 会分别查询两个来源：BOSS 命中不会影响公共网刷新，公共网命中也不会绕过 BOSS 的账号保护。
+4. 缓存未命中时，每个平台分别通过 SQLite 跨进程预约请求时隙。BOSS 默认至少间隔 10 秒，公共网默认至少间隔 2 秒。
+5. 并发的相同来源请求在等待限流时隙后会再次检查自己的缓存，避免缓存击穿。
+6. 缓存只覆盖当前请求实际需要的数据，不为提高命中率而主动预取额外页面；较小 `limit` 可复用较大结果缓存。
+7. 过期条目在读取时立即删除并回源刷新；无效 JSON 缓存也会自动删除。
+8. “打招呼”等具有副作用的操作永不使用响应缓存。
+
+`boss-cli-config` 命名卷已经持久保存该数据库，因此容器重启后各平台缓存和请求预约状态仍有效。账号敏感或调用量较大时，建议把 `BOSS_PLUGIN_MIN_INTERVAL_S` 提高到 `15` 或 `30`，并把 `BOSS_PLUGIN_CACHE_TTL_S` 提高到 `3600`。不要为了追求实时性将它们调低；代码会拒绝低于安全下限的配置。
+
+### LLM 语义缓存别名
+
+可选 LLM 层已经实现。它用于将“Python 服务端”“Python 后端开发”等高置信度同义表达映射到同一个平台缓存键，提高星辰 Agent 改写问题后的命中率。该能力默认关闭，启用时必须同时配置 `LLM_API_KEY` 和 `LLM_MODEL`。
+
+安全边界如下：
+
+1. 模型按平台独立规划，`boss` 与 `public` 使用不同的 SQLite 语义别名命名空间，不能跨平台命中。
+2. 模型只输出 `canonical_keyword` 与 `confidence`，只用于计算缓存键。实际发往招聘平台的关键词始终是用户原始关键词。
+3. 城市、来源、页码、数量、筛选、授权状态和回源参数均由本地代码锁定，模型无权修改。
+4. 只有置信度达到阈值、长度合法且不含换行或空字符的输出才会接受；其余情况原样查询。
+5. 模型超时、HTTP 错误、非法 JSON 或低置信度不会阻断插件，也不会直接触发额外回源；安全回退会短暂写入负缓存，防止 Agent 循环重复调用模型。
+6. SQLite 只保存不可逆缓存键、规范关键词和置信度，不保存 `LLM_API_KEY`，也不会把 BOSS Cookie 发送给模型。
+7. 即使语义缓存未命中，后续平台请求仍必须经过该平台原有的授权检查、过期检查和 SQLite 跨进程限流闸门。
+
+启用示例配置：
+
+```dotenv
+LLM_SEMANTIC_CACHE_ENABLED=true
+LLM_BASE_URL=https://你的兼容服务/v1
+LLM_API_KEY=由密钥管理服务注入
+LLM_MODEL=你的模型名称
+LLM_SEMANTIC_CONFIDENCE=0.92
+LLM_SEMANTIC_ALIAS_TTL_S=604800
+LLM_TIMEOUT_S=5
+```
+
+不要把 `LLM_API_KEY` 写入 Compose 文件、镜像或 Git。对于不支持 `response_format=json_object` 的兼容服务，规划会安全降级为精确缓存；可以保持功能关闭，现有 SQLite 缓存和平台限流不受影响。
 
 ### GitHub Actions 与 GHCR 镜像
 
@@ -40,7 +135,7 @@
 - Swagger 调试页：`GET /docs`
 - 插件动作：`POST /api/v1/jobs/search`
 
-生产环境应使用 HTTPS 反向代理，并只向星辰平台开放插件地址。不要将 `.env`、Cookie 或 API Key 提交到 Git。
+生产环境应配置 `PLUGIN_API_KEY`、使用 HTTPS 反向代理，并只向星辰平台开放插件地址。不要将 `.env`、Cookie 或 API Key 提交到 Git。
 
 ## 星辰平台配置
 

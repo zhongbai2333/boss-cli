@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import logging
+import re
 import time
 
 import click
@@ -237,7 +238,7 @@ def recruiter_greet(encrypt_geek_id: str, encrypt_job_id: str, as_json: bool, as
 @recruiter.command("batch-view")
 @click.argument("keyword")
 @click.option("-c", "--city", default="上海", help="城市名称或代码")
-@click.option("-n", "--count", default=5, type=int, help="查看数量 (默认: 5)")
+@click.option("-n", "--count", default=5, type=click.IntRange(1, 20), help="查看数量 (1-20, 默认: 5)")
 @click.option("--salary", type=click.Choice(list(SALARY_CODES.keys())), help="薪资筛选")
 @click.option("--exp", type=click.Choice(list(EXP_CODES.keys())), help="工作经验筛选")
 @click.option("--degree", type=click.Choice(list(DEGREE_CODES.keys())), help="学历筛选")
@@ -257,6 +258,8 @@ def recruiter_batch_view(
 
     例: boss recruiter batch-view "golang" --city 上海 -n 10
     """
+    if not 1 <= count <= 20:
+        raise click.BadParameter("必须在 1 到 20 之间", param_hint="--count")
     cred = require_auth()
     city_code = resolve_city(city)
     salary_code = SALARY_CODES.get(salary) if salary else None
@@ -958,8 +961,11 @@ def recruiter_resume_download(
 
         # Write to file or stdout
         if output_file is None:
-            safe_name = name.replace("/", "_").replace(" ", "_")
-            output_file = f"{safe_name}_resume.md"
+            safe_name = re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", str(name)).strip("._ ")
+            if not safe_name or safe_name.upper() in {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}:
+                safe_name = "candidate"
+            safe_id = re.sub(r"[^0-9A-Za-z_-]+", "", encrypt_geek_id)[-12:] or "unknown"
+            output_file = f"{safe_name}_{safe_id}_resume.md"
 
         if output_file == "-":
             click.echo(md_content)

@@ -79,7 +79,7 @@ def greet(security_id: str, lid: str, as_json: bool, as_yaml: bool) -> None:
 @click.command("batch-greet")
 @click.argument("keyword")
 @click.option("-c", "--city", default="全国", help="城市名称或代码")
-@click.option("-n", "--count", default=5, type=int, help="打招呼数量 (默认: 5)")
+@click.option("-n", "--count", default=5, type=click.IntRange(1, 20), help="打招呼数量 (1-20, 默认: 5)")
 @click.option("--salary", type=click.Choice(list(SALARY_CODES.keys())), help="薪资筛选")
 @click.option("--exp", type=click.Choice(list(EXP_CODES.keys())), help="工作经验筛选")
 @click.option("--degree", type=click.Choice(list(DEGREE_CODES.keys())), help="学历筛选")
@@ -90,6 +90,8 @@ def batch_greet(keyword: str, city: str, count: int, salary: str | None, exp: st
 
     例: boss batch-greet "golang" --city 杭州 -n 10 --salary 20-30K
     """
+    if not 1 <= count <= 20:
+        raise click.BadParameter("必须在 1 到 20 之间", param_hint="--count")
     cred = require_auth()
 
     city_code = resolve_city(city)

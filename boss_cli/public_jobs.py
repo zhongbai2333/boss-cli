@@ -6,7 +6,6 @@ import ast
 import json
 import os
 import re
-import threading
 import time
 from typing import Any
 from urllib.parse import urljoin
@@ -15,6 +14,7 @@ import httpx
 from lxml import html
 
 from .job_sources import UnifiedJob
+from .sqlite_cache import SQLiteCache, make_cache_key
 
 PUBLIC_JOBS_BASE_URL = "http://job.mohrss.gov.cn"
 PUBLIC_JOBS_LIST_URL = f"{PUBLIC_JOBS_BASE_URL}/cjobs/jobinfolist/listJobinfolist"
@@ -142,29 +142,66 @@ def parse_public_jobs(
 
 
 class PublicJobsClient:
-    """Small authorized scraper with process-wide conservative throttling."""
+    """Authorized source adapter with independent SQLite caching and throttling."""
 
-    _request_lock = threading.Lock()
-    _last_request_at = 0.0
-
-    def __init__(self, *, timeout: float = 20.0, minimum_interval: float = 2.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 20.0,
+        minimum_interval: float | None = None,
+        cache_ttl_s: float | None = None,
+        cache: SQLiteCache | None = None,
+    ) -> None:
         self.timeout = timeout
-        self.minimum_interval = max(minimum_interval, 1.0)
+        self.minimum_interval = _safe_float_env(
+            "PUBLIC_PLUGIN_MIN_INTERVAL_S",
+            2.0 if minimum_interval is None else minimum_interval,
+            1.0,
+        )
+        self.cache_ttl_s = _safe_float_env(
+            "PUBLIC_PLUGIN_CACHE_TTL_S",
+            1800.0 if cache_ttl_s is None else cache_ttl_s,
+            60.0,
+        )
+        self.cache = cache or SQLiteCache()
 
     def _wait_for_slot(self) -> None:
-        with self._request_lock:
-            elapsed = time.monotonic() - type(self)._last_request_at
-            if elapsed < self.minimum_interval:
-                time.sleep(self.minimum_interval - elapsed)
-            type(self)._last_request_at = time.monotonic()
+        wait_s = self.cache.reserve_request_slot(
+            "source:public:upstream",
+            min_interval_s=self.minimum_interval,
+        )
+        if wait_s > 0:
+            time.sleep(wait_s)
 
     def search(
-        self, keyword: str, *, city: str = "", page: int = 1, limit: int = 20, scan_pages: int = 1,
+        self,
+        keyword: str,
+        *,
+        city: str = "",
+        page: int = 1,
+        limit: int = 20,
+        scan_pages: int = 1,
+        cache_keyword: str | None = None,
     ) -> list[UnifiedJob]:
         if not authorization_confirmed():
             raise PermissionError(
                 "中国公共招聘网采集未启用：仅在已取得书面授权时设置 MOHRSS_AUTHORIZED=true"
             )
+
+        bounded_scan_pages = min(max(scan_pages, 1), 5)
+        cache_key = make_cache_key(
+            "public",
+            _clean(cache_keyword or keyword).casefold(),
+            _clean(city).casefold(),
+            page,
+            bounded_scan_pages,
+        )
+        cached = self.cache.get("source:public:jobs", cache_key)
+        if isinstance(cached, dict):
+            cached_jobs = cached.get("items")
+            covered_limit = cached.get("covered_limit", 0)
+            if isinstance(cached_jobs, list) and isinstance(covered_limit, int) and covered_limit >= limit:
+                return cached_jobs[:limit]
 
         headers = {
             "User-Agent": "boss-cli-astron-plugin/0.1 (authorized educational integration)",
@@ -175,8 +212,16 @@ class PublicJobsClient:
         # and filter each page's (maximum 20) records locally.
         with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=headers) as client:
             jobs: list[UnifiedJob] = []
-            for current_page in range(page, page + min(max(scan_pages, 1), 5)):
+            for current_page in range(page, page + bounded_scan_pages):
                 self._wait_for_slot()
+                # Another worker may have filled this query while this worker
+                # waited for the shared upstream slot.
+                cached = self.cache.get("source:public:jobs", cache_key)
+                if isinstance(cached, dict):
+                    cached_jobs = cached.get("items")
+                    covered_limit = cached.get("covered_limit", 0)
+                    if isinstance(cached_jobs, list) and isinstance(covered_limit, int) and covered_limit >= limit:
+                        return cached_jobs[:limit]
                 response = client.get(
                     PUBLIC_JOBS_LIST_URL,
                     params={"pageNo": current_page, "orderType": "score"},
@@ -190,4 +235,17 @@ class PublicJobsClient:
                 ))
                 if len(jobs) >= limit:
                     break
+        self.cache.set(
+            "source:public:jobs",
+            cache_key,
+            {"items": jobs[:limit], "covered_limit": limit},
+            ttl_s=self.cache_ttl_s,
+        )
         return jobs[:limit]
+
+
+def _safe_float_env(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default

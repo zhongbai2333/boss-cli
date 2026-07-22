@@ -24,6 +24,15 @@ class TestCliBasic:
         assert result.exit_code == 0
         assert "0." in result.output
 
+    def test_runtime_version_matches_project_metadata(self):
+        import tomllib
+        from pathlib import Path
+
+        from boss_cli import __version__
+
+        project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+        assert __version__ == project["project"]["version"]
+
     def test_help(self):
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
@@ -32,7 +41,8 @@ class TestCliBasic:
     def test_all_commands_registered(self):
         result = runner.invoke(cli, ["--help"])
         expected = [
-            "login", "status", "logout", "me",
+            "login", "status", "logout", "me", "config-export", "config-import",
+            "credential-export", "credential-import",
             "search", "recommend", "cities", "detail", "show", "export", "history",
             "applied", "interviews",
             "chat", "greet", "batch-greet",
@@ -45,7 +55,8 @@ class TestCommandHelp:
     """Verify every command has --help without errors."""
 
     @pytest.mark.parametrize("cmd", [
-        "login", "logout", "status", "me",
+        "login", "logout", "status", "me", "config-export", "config-import",
+        "credential-export", "credential-import",
         "search", "recommend", "cities", "detail", "show", "export", "history",
         "applied", "interviews",
         "chat", "greet", "batch-greet",
@@ -81,6 +92,8 @@ class TestCommandHelp:
         result = runner.invoke(cli, ["login", "--help"])
         assert "--cookie-source" in result.output
         assert "--qrcode" in result.output
+        assert "--cdp" in result.output
+        assert "--cdp-port" in result.output
 
     def test_history_has_options(self):
         result = runner.invoke(cli, ["history", "--help"])
@@ -188,6 +201,145 @@ class TestAuthCommands:
             result = runner.invoke(cli, ["logout"])
             assert result.exit_code == 0
             assert "已退出" in result.output
+
+    def test_credential_export_uses_environment_password(self, tmp_path):
+        from boss_cli.auth import Credential
+
+        credential = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        output = tmp_path / "session.bosscred"
+        with patch("boss_cli.auth.refresh_credential", return_value=(credential, [])):
+            result = runner.invoke(
+                cli,
+                ["credential-export", str(output)],
+                env={"BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple"},
+            )
+
+        assert result.exit_code == 0
+        assert output.exists()
+        assert "secret" not in output.read_text(encoding="utf-8")
+
+    def test_credential_import_saves_package(self, tmp_path):
+        from boss_cli.auth import Credential
+        from boss_cli.credential_transfer import export_credential_file
+
+        credential = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        package = tmp_path / "session.bosscred"
+        export_credential_file(package, credential, "correct horse battery staple")
+        with patch("boss_cli.auth.load_credential", return_value=None), \
+             patch("boss_cli.auth.save_credential") as save:
+            result = runner.invoke(
+                cli,
+                ["credential-import", str(package), "--force"],
+                env={"BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple"},
+            )
+
+        assert result.exit_code == 0
+        assert save.call_args.args[0].cookies == credential.cookies
+
+    def test_credential_import_verify_failure_restores_previous(self, tmp_path):
+        from boss_cli.auth import Credential
+        from boss_cli.credential_transfer import export_credential_file
+
+        previous = Credential({"__zp_stoken__": "old-s", "wt2": "old-1", "wbg": "old-2", "zp_at": "old-3"})
+        imported = Credential({"__zp_stoken__": "new-s", "wt2": "new-1", "wbg": "new-2", "zp_at": "new-3"})
+        package = tmp_path / "session.bosscred"
+        export_credential_file(package, imported, "correct horse battery staple")
+        with patch("boss_cli.auth.load_credential", return_value=previous), \
+             patch("boss_cli.auth.save_credential") as save, \
+             patch("boss_cli.auth.verify_credential", return_value=(False, "expired")):
+            result = runner.invoke(
+                cli,
+                ["credential-import", str(package), "--force", "--verify"],
+                env={"BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple"},
+            )
+
+        assert result.exit_code == 1
+        assert save.call_count == 2
+        assert save.call_args_list[-1].args[0] is previous
+
+    def test_config_export_includes_portable_environment(self, tmp_path):
+        from boss_cli.auth import Credential
+        from boss_cli.config_transfer import import_config_file
+
+        credential = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        output = tmp_path / "cloud.bossconfig"
+        with patch("boss_cli.auth.refresh_credential", return_value=(credential, [])):
+            result = runner.invoke(
+                cli,
+                ["config-export", str(output)],
+                env={
+                    "BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple",
+                    "PLUGIN_API_KEY": "plugin-secret",
+                    "LLM_MODEL": "test-model",
+                },
+            )
+
+        assert result.exit_code == 0, result.output
+        bundle = import_config_file(output, "correct horse battery staple")
+        assert bundle.credential.cookies == credential.cookies
+        assert bundle.settings["PLUGIN_API_KEY"] == "plugin-secret"
+        assert bundle.settings["LLM_MODEL"] == "test-model"
+        assert "BOSS_CREDENTIAL_PASSPHRASE" not in bundle.settings
+
+    def test_config_import_writes_credential_and_plugin_env(self, tmp_path, monkeypatch):
+        from dotenv import dotenv_values
+
+        from boss_cli.auth import Credential
+        from boss_cli.config_transfer import export_config_file
+        from boss_cli import constants
+
+        credential = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        package = tmp_path / "cloud.bossconfig"
+        plugin_env = tmp_path / "plugin.env"
+        export_config_file(
+            package,
+            credential,
+            {"PLUGIN_API_KEY": "cloud-secret", "PLUGIN_PORT": "8000"},
+            "correct horse battery staple",
+        )
+        monkeypatch.setattr(constants, "PLUGIN_ENV_FILE", plugin_env)
+        with patch("boss_cli.auth.load_credential", return_value=None), patch("boss_cli.auth.save_credential") as save:
+            result = runner.invoke(
+                cli,
+                ["config-import", str(package), "--force"],
+                env={"BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple"},
+            )
+
+        assert result.exit_code == 0, result.output
+        assert save.call_args.args[0].cookies == credential.cookies
+        assert dotenv_values(plugin_env)["PLUGIN_API_KEY"] == "cloud-secret"
+
+    def test_config_import_verify_failure_rolls_back_both_files(self, tmp_path, monkeypatch):
+        from dotenv import dotenv_values
+
+        from boss_cli import constants
+        from boss_cli.auth import Credential
+        from boss_cli.config_transfer import export_config_file
+
+        previous = Credential({"__zp_stoken__": "old-s", "wt2": "old-1", "wbg": "old-2", "zp_at": "old-3"})
+        imported = Credential({"__zp_stoken__": "new-s", "wt2": "new-1", "wbg": "new-2", "zp_at": "new-3"})
+        package = tmp_path / "cloud.bossconfig"
+        plugin_env = tmp_path / "plugin.env"
+        plugin_env.write_text('PLUGIN_API_KEY="old-secret"\n', encoding="utf-8")
+        export_config_file(
+            package,
+            imported,
+            {"PLUGIN_API_KEY": "new-secret"},
+            "correct horse battery staple",
+        )
+        monkeypatch.setattr(constants, "PLUGIN_ENV_FILE", plugin_env)
+        with patch("boss_cli.auth.load_credential", return_value=previous), \
+             patch("boss_cli.auth.save_credential") as save, \
+             patch("boss_cli.auth.verify_credential", return_value=(False, "expired")):
+            result = runner.invoke(
+                cli,
+                ["config-import", str(package), "--force", "--verify"],
+                env={"BOSS_CREDENTIAL_PASSPHRASE": "correct horse battery staple"},
+            )
+
+        assert result.exit_code == 1
+        assert save.call_args_list[-1].args[0] is previous
+        assert dotenv_values(plugin_env)["PLUGIN_API_KEY"] == "old-secret"
 
 
 # ── Personal commands (mocked) ──────────────────────────────────────
@@ -431,6 +583,201 @@ class TestClient:
         with pytest.raises(RuntimeError, match="Client not initialized"):
             _ = client.client
 
+    def test_response_cookie_updates_credential_and_persists(self):
+        import httpx
+
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+
+        cred = Credential(cookies={"wt2": "old"})
+        response = httpx.Response(
+            200,
+            headers={"set-cookie": "wt2=new; Path=/; Domain=.zhipin.com"},
+            request=httpx.Request("GET", "https://www.zhipin.com/"),
+        )
+        with BossClient(cred) as client, patch("boss_cli.auth.save_credential") as save:
+            client._merge_response_cookies(response)
+
+        assert cred.cookies["wt2"] == "new"
+        save.assert_called_once_with(cred)
+
+    def test_unchanged_response_cookie_does_not_write(self):
+        import httpx
+
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+
+        cred = Credential(cookies={"wt2": "same"})
+        response = httpx.Response(
+            200,
+            headers={"set-cookie": "wt2=same; Path=/; Domain=.zhipin.com"},
+            request=httpx.Request("GET", "https://www.zhipin.com/"),
+        )
+        with BossClient(cred) as client, patch("boss_cli.auth.save_credential") as save:
+            client._merge_response_cookies(response)
+
+        save.assert_not_called()
+
+    def test_post_network_error_is_not_retried(self, monkeypatch):
+        import httpx
+
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.exceptions import BossApiError
+
+        cred = Credential(cookies={"wt2": "one"})
+        with BossClient(cred, request_delay=0, max_retries=3) as client:
+            request = MagicMock(side_effect=httpx.ReadTimeout("timeout"))
+            monkeypatch.setattr(client.client, "request", request)
+            monkeypatch.setattr("boss_cli.client.time.sleep", lambda *_: None)
+            with pytest.raises(BossApiError, match="1 attempt"):
+                client._request("POST", "/write", data={"value": "x"})
+
+        assert request.call_count == 1
+
+    def test_get_network_error_can_retry(self, monkeypatch):
+        import httpx
+
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"code": 0, "zpData": {}}'
+        response.json.return_value = {"code": 0, "zpData": {}}
+        response.cookies.items.return_value = []
+        cred = Credential(cookies={"wt2": "one"})
+        with BossClient(cred, request_delay=0, max_retries=3) as client:
+            request = MagicMock(side_effect=[httpx.ReadTimeout("timeout"), response])
+            monkeypatch.setattr(client.client, "request", request)
+            monkeypatch.setattr("boss_cli.client.time.sleep", lambda *_: None)
+            result = client._request("GET", "/read")
+
+        assert result["code"] == 0
+        assert request.call_count == 2
+
+    def test_get_prefers_fresh_sqlite_cache(self, tmp_path, monkeypatch):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.sqlite_cache import SQLiteCache, make_cache_key
+
+        credential = Credential(cookies={"wt2": "account-one"})
+        cache = SQLiteCache(tmp_path / "cache.db")
+        with BossClient(credential, cache=cache, request_delay=0) as client:
+            key = make_cache_key(client._cache_scope, "/read", {"page": 1})
+            cache.set("source:boss:api-get", key, {"cached": True}, ttl_s=60)
+            request = MagicMock()
+            monkeypatch.setattr(client.client, "request", request)
+
+            result = client._get("/read", params={"page": 1}, action="读取")
+
+        assert result == {"cached": True}
+        request.assert_not_called()
+
+    def test_expired_cache_is_removed_and_refreshed(self, tmp_path, monkeypatch):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.sqlite_cache import SQLiteCache, make_cache_key
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"code": 0, "zpData": {"fresh": true}}'
+        response.json.return_value = {"code": 0, "zpData": {"fresh": True}}
+        response.cookies.items.return_value = []
+        credential = Credential(cookies={"wt2": "account-one"})
+        cache = SQLiteCache(tmp_path / "cache.db")
+        with BossClient(credential, cache=cache, request_delay=0) as client:
+            key = make_cache_key(client._cache_scope, "/read", {})
+            cache.set("source:boss:api-get", key, {"stale": True}, ttl_s=1, now=100)
+            request = MagicMock(return_value=response)
+            monkeypatch.setattr(client.client, "request", request)
+
+            result = client._get("/read", action="读取")
+
+        assert result == {"fresh": True}
+        request.assert_called_once()
+        assert cache.get("source:boss:api-get", key) == {"fresh": True}
+
+    def test_side_effect_get_never_uses_cache(self, tmp_path, monkeypatch):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.sqlite_cache import SQLiteCache
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"code": 0, "zpData": {"success": true}}'
+        response.json.return_value = {"code": 0, "zpData": {"success": True}}
+        response.cookies.items.return_value = []
+        with BossClient(
+            Credential(cookies={"wt2": "account-one"}),
+            cache=SQLiteCache(tmp_path / "cache.db"),
+            request_delay=0,
+        ) as client:
+            request = MagicMock(return_value=response)
+            monkeypatch.setattr(client.client, "request", request)
+            client.add_friend("security", "lid")
+            client.add_friend("security", "lid")
+
+        assert request.call_count == 2
+
+    def test_api_cache_is_isolated_by_account(self, tmp_path, monkeypatch):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.sqlite_cache import SQLiteCache
+
+        cache = SQLiteCache(tmp_path / "cache.db")
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"code": 0, "zpData": {"owner": "a"}}'
+        response.json.return_value = {"code": 0, "zpData": {"owner": "a"}}
+        response.cookies.items.return_value = []
+        with BossClient(Credential({"wt2": "account-a"}), cache=cache, request_delay=0) as first:
+            monkeypatch.setattr(first.client, "request", MagicMock(return_value=response))
+            assert first._get("/profile") == {"owner": "a"}
+
+        with BossClient(Credential({"wt2": "account-b"}), cache=cache, request_delay=0) as second:
+            request = MagicMock(return_value=response)
+            monkeypatch.setattr(second.client, "request", request)
+            second._get("/profile")
+
+        request.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("text", "json_value", "message"),
+        [
+            ("not-json", ValueError("bad json"), "Invalid JSON response"),
+            ('["unexpected"]', ["unexpected"], "Invalid JSON object response"),
+            ("  \ufeff  <html>login</html>", None, "HTML instead of JSON"),
+        ],
+    )
+    def test_invalid_response_protocol_is_wrapped(self, monkeypatch, text, json_value, message):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.exceptions import BossApiError
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = text
+        response.cookies.items.return_value = []
+        if isinstance(json_value, Exception):
+            response.json.side_effect = json_value
+        else:
+            response.json.return_value = json_value
+
+        with BossClient(Credential({"wt2": "one"}), request_delay=0) as client:
+            monkeypatch.setattr(client.client, "request", MagicMock(return_value=response))
+            with pytest.raises(BossApiError, match=message):
+                client._request("GET", "/broken")
+
+    def test_handle_response_rejects_invalid_zpdata_type(self):
+        from boss_cli.auth import Credential
+        from boss_cli.client import BossClient
+        from boss_cli.exceptions import BossApiError
+
+        with BossClient(Credential({"wt2": "one"})) as client:
+            with pytest.raises(BossApiError, match="zpData"):
+                client._handle_response({"code": 0, "zpData": "unexpected"}, "test")
+
     def test_handle_response_success(self):
         from boss_cli.auth import Credential
         from boss_cli.client import BossClient
@@ -620,7 +967,7 @@ class TestIndexCache:
     def test_save_and_get(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
-        monkeypatch.setattr(index_cache, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
 
         jobs = [
             {"securityId": "abc123", "jobName": "Go Dev", "brandName": "Company A"},
@@ -640,7 +987,7 @@ class TestIndexCache:
     def test_get_out_of_range(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
-        monkeypatch.setattr(index_cache, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
 
         jobs = [{"securityId": "abc", "jobName": "Test"}]
         index_cache.save_index(jobs, source="test")
@@ -649,12 +996,13 @@ class TestIndexCache:
     def test_get_no_cache(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "nonexistent.json")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
         assert index_cache.get_job_by_index(1) is None
 
     def test_get_index_info(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
-        monkeypatch.setattr(index_cache, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
 
         info = index_cache.get_index_info()
         assert not info["exists"]
@@ -668,8 +1016,42 @@ class TestIndexCache:
     def test_zero_and_negative_index(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
         assert index_cache.get_job_by_index(0) is None
         assert index_cache.get_job_by_index(-1) is None
+
+    def test_expired_index_cache_is_not_returned(self, tmp_path, monkeypatch):
+        from boss_cli import index_cache
+
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_TTL_S", 1)
+        monkeypatch.setattr("boss_cli.index_cache.time.time", lambda: 100.0)
+        monkeypatch.setattr("boss_cli.sqlite_cache.time.time", lambda: 100.0)
+        index_cache.save_index([{"securityId": "x", "jobName": "T"}])
+        monkeypatch.setattr("boss_cli.sqlite_cache.time.time", lambda: 102.0)
+
+        assert index_cache.get_job_by_index(1) is None
+        assert index_cache.get_index_info() == {"exists": False, "count": 0}
+
+    def test_migrates_fresh_legacy_json(self, tmp_path, monkeypatch):
+        from boss_cli import index_cache
+
+        legacy = tmp_path / "index_cache.json"
+        legacy.write_text(json.dumps({
+            "source": "legacy",
+            "saved_at": 100.0,
+            "count": 1,
+            "items": [{"securityId": "legacy-id", "jobName": "Legacy"}],
+        }), encoding="utf-8")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", legacy)
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_TTL_S", 100)
+        monkeypatch.setattr("boss_cli.index_cache.time.time", lambda: 150.0)
+        monkeypatch.setattr("boss_cli.sqlite_cache.time.time", lambda: 150.0)
+
+        assert index_cache.get_job_by_index(1)["securityId"] == "legacy-id"
+        assert not legacy.exists()
 
 
 # ── Show command ────────────────────────────────────────────────────
@@ -681,6 +1063,7 @@ class TestShowCommand:
     def test_show_no_cache(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "nonexistent.json")
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
         result = runner.invoke(cli, ["show", "1"])
         assert result.exit_code == 0
         assert "暂无缓存" in result.output
@@ -688,7 +1071,7 @@ class TestShowCommand:
     def test_show_out_of_range(self, tmp_path, monkeypatch):
         from boss_cli import index_cache
         monkeypatch.setattr(index_cache, "INDEX_CACHE_FILE", tmp_path / "index_cache.json")
-        monkeypatch.setattr(index_cache, "CONFIG_DIR", tmp_path)
+        monkeypatch.setattr(index_cache, "INDEX_CACHE_DB_FILE", tmp_path / "cache.db")
         index_cache.save_index([{"securityId": "x", "jobName": "T"}])
         result = runner.invoke(cli, ["show", "99"])
         assert result.exit_code == 0
@@ -921,6 +1304,20 @@ class TestCommandFailures:
             result = runner.invoke(cli, ["batch-greet", "Python", "--dry-run"])
             assert result.exit_code == 1
             assert "搜索失败" in result.output
+
+    @pytest.mark.parametrize("count", ["0", "-1", "21"])
+    def test_batch_greet_rejects_unsafe_count(self, count):
+        result = runner.invoke(cli, ["batch-greet", "Python", "--count", count])
+
+        assert result.exit_code == 2
+        assert "range" in result.output.lower() or "范围" in result.output
+
+    @pytest.mark.parametrize("count", ["0", "-1", "21"])
+    def test_recruiter_batch_view_rejects_unsafe_count(self, count):
+        result = runner.invoke(cli, ["recruiter", "batch-view", "Python", "--count", count])
+
+        assert result.exit_code == 2
+        assert "range" in result.output.lower() or "范围" in result.output
 
     def test_batch_greet_refreshes_after_session_expiry(self):
         from boss_cli.exceptions import SessionExpiredError

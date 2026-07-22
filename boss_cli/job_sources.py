@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal, TypedDict
 
 from .auth import get_credential
 from .client import BossClient, resolve_city
 
 SourceName = Literal["boss", "public"]
+
+
+def _safe_float_env(name: str, default: float, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
 
 
 class UnifiedJob(TypedDict):
@@ -51,17 +59,31 @@ def normalize_boss_job(job: dict[str, Any]) -> UnifiedJob:
     }
 
 
-def search_boss_jobs(keyword: str, city: str, page: int, limit: int) -> list[UnifiedJob]:
+def search_boss_jobs(
+    keyword: str,
+    city: str,
+    page: int,
+    limit: int,
+    *,
+    cache_keyword: str | None = None,
+) -> list[UnifiedJob]:
     """Search BOSS with an existing authorized user session."""
     credential = get_credential()
     if credential is None:
         raise RuntimeError("BOSS 数据源未配置凭据，请设置 BOSS_COOKIES 或先执行 boss login")
 
-    with BossClient(credential) as client:
+    cache_ttl_s = _safe_float_env("BOSS_PLUGIN_CACHE_TTL_S", 1800.0, 60.0)
+    min_interval_s = _safe_float_env("BOSS_PLUGIN_MIN_INTERVAL_S", 10.0, 5.0)
+    with BossClient(
+        credential,
+        cache_ttl_s=cache_ttl_s,
+        min_request_interval_s=min_interval_s,
+    ) as client:
         data = client.search_jobs(
             query=keyword,
             city=resolve_city(city or "全国"),
             page=page,
             page_size=min(limit, 15),
+            cache_query=cache_keyword,
         )
     return [normalize_boss_job(job) for job in data.get("jobList", [])[:limit]]

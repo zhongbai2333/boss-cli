@@ -156,6 +156,18 @@ class TestExtractCookiesFromJar:
         from boss_cli.auth import _extract_cookies_from_jar
         assert _extract_cookies_from_jar([], source="test") is None
 
+    def test_rejects_lookalike_zhipin_domains(self):
+        from boss_cli.auth import _extract_cookies_from_jar
+
+        cookies = [
+            self._Cookie("evilzhipin.com", "wt2", "bad"),
+            self._Cookie("zhipin.com.evil.example", "zp_at", "bad"),
+            self._Cookie("jobs.zhipin.com", "wbg", "good"),
+        ]
+        result = _extract_cookies_from_jar(cookies, source="test")
+
+        assert result == {"wbg": "good"}
+
 
 # ── Browser order ───────────────────────────────────────────────────
 
@@ -212,4 +224,37 @@ class TestExtractInProcess:
 
         assert cred is not None
         assert cred.cookies["wt2"] == "test_val"
+
+
+# ── Live CDP refresh ────────────────────────────────────────────────
+
+
+class TestRefreshCredential:
+    """A running CDP browser should take precedence over disk extraction."""
+
+    def test_prefers_complete_cdp_credential(self):
+        from boss_cli.auth import Credential, refresh_credential
+
+        cred = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        with patch("boss_cli.cdp_login.extract_cdp_credential", return_value=cred), \
+             patch("boss_cli.auth.extract_browser_credential") as browser_extract, \
+             patch("boss_cli.auth.save_credential") as save:
+            result, diagnostics = refresh_credential()
+
+        assert result is cred
+        assert diagnostics == []
+        browser_extract.assert_not_called()
+        save.assert_called_once_with(cred)
+
+    def test_falls_back_when_cdp_has_partial_cookies(self):
+        from boss_cli.auth import Credential, refresh_credential
+
+        partial = Credential({"wt2": "old"})
+        fresh = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        with patch("boss_cli.cdp_login.extract_cdp_credential", return_value=partial), \
+             patch("boss_cli.auth.extract_browser_credential", return_value=(fresh, ["browser ok"])):
+            result, diagnostics = refresh_credential("chrome")
+
+        assert result is fresh
+        assert diagnostics == ["browser ok"]
 """Tests for boss_cli.auth — diagnostics, env fallback, and extraction."""

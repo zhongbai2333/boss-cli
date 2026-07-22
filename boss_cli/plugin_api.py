@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import hmac
 from typing import Literal
 
 import uvicorn
@@ -11,9 +12,16 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from . import __version__
+from .constants import PLUGIN_ENV_FILE
 from .job_sources import UnifiedJob, search_boss_jobs
 from .public_jobs import PublicJobsClient
+from .semantic_cache import SemanticQueryPlanner
 
+# A config-import package is an explicit, validated deployment snapshot. Load
+# it with override so Compose env_file placeholders cannot silently defeat a
+# one-click migration after restart. Non-portable runtime variables (including
+# the transfer passphrase) are never present in this managed file.
+load_dotenv(PLUGIN_ENV_FILE, override=True)
 load_dotenv()
 
 
@@ -59,7 +67,12 @@ app = FastAPI(
 def verify_plugin_key(x_plugin_key: str | None = Header(default=None)) -> None:
     """Use Astron Service/Header authentication when a key is configured."""
     expected = os.environ.get("PLUGIN_API_KEY", "")
-    if expected and x_plugin_key != expected:
+    allow_anonymous = os.environ.get("PLUGIN_ALLOW_ANONYMOUS", "").strip().lower() in {"1", "true", "yes"}
+    if not expected:
+        if allow_anonymous:
+            return
+        raise HTTPException(status_code=503, detail="Plugin API key is not configured")
+    if x_plugin_key is None or not hmac.compare_digest(x_plugin_key, expected):
         raise HTTPException(status_code=401, detail="Invalid plugin API key")
 
 
@@ -79,12 +92,20 @@ def search_jobs(request: JobSearchRequest) -> JobSearchResponse:
     """按关键词和城市检索一个或两个招聘来源，并返回统一格式。"""
     jobs: list[UnifiedJob] = []
     errors: list[SourceError] = []
+    planner = SemanticQueryPlanner.from_env()
 
     sources = ("boss", "public") if request.source == "all" else (request.source,)
     for source in sources:
         try:
+            plan = planner.plan(source, request.keyword, request.city)
             if source == "boss":
-                jobs.extend(search_boss_jobs(request.keyword, request.city, request.page, request.limit))
+                jobs.extend(search_boss_jobs(
+                    request.keyword,
+                    request.city,
+                    request.page,
+                    request.limit,
+                    cache_keyword=plan.canonical_keyword,
+                ))
             else:
                 jobs.extend(PublicJobsClient().search(
                     request.keyword,
@@ -92,6 +113,7 @@ def search_jobs(request: JobSearchRequest) -> JobSearchResponse:
                     page=request.page,
                     limit=request.limit,
                     scan_pages=request.public_scan_pages,
+                    cache_keyword=plan.canonical_keyword,
                 ))
         except Exception as exc:  # Isolate upstream failures so the other source remains useful.
             errors.append(SourceError(source=source, message=str(exc)))
@@ -111,6 +133,6 @@ def main() -> None:
     """Run the plugin API using environment-based host/port settings."""
     uvicorn.run(
         "boss_cli.plugin_api:app",
-        host=os.environ.get("PLUGIN_HOST", "0.0.0.0"),
+        host=os.environ.get("PLUGIN_HOST", "127.0.0.1"),
         port=int(os.environ.get("PLUGIN_PORT", "8000")),
     )

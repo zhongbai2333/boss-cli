@@ -5,7 +5,13 @@ from pathlib import Path
 # ── Config ──────────────────────────────────────────────────────────
 CONFIG_DIR = Path.home() / ".config" / "boss-cli"
 CREDENTIAL_FILE = CONFIG_DIR / "credential.json"
+CACHE_DB_FILE = CONFIG_DIR / "cache.db"
+PLUGIN_ENV_FILE = CONFIG_DIR / "plugin.env"
+CDP_PROFILE_DIR = CONFIG_DIR / "chrome-profile"
+DEFAULT_CDP_PORT = 9222
 AUTH_HEALTH_CACHE_TTL_S = 45
+API_CACHE_TTL_S = 300
+INDEX_CACHE_TTL_S = 86400
 
 # ── Base URL ────────────────────────────────────────────────────────
 BASE_URL = "https://www.zhipin.com"
@@ -94,6 +100,12 @@ HEADERS = {
 
 # ── Cookie keys required for authenticated sessions ─────────────────
 REQUIRED_COOKIES = {"__zp_stoken__", "wt2", "wbg", "zp_at"}
+
+
+def is_zhipin_cookie_domain(domain: str) -> bool:
+    """Accept only the zhipin.com root domain and its real subdomains."""
+    normalized = domain.strip().lstrip(".").lower()
+    return normalized == "zhipin.com" or normalized.endswith(".zhipin.com")
 
 # ── City codes ──────────────────────────────────────────────────────
 CITY_CODES: dict[str, str] = {

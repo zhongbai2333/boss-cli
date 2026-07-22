@@ -2,7 +2,7 @@
 name: boss-cli
 description: Use boss-cli for ALL BOSS 直聘 operations — searching jobs, viewing recommendations, managing applications, chatting with recruiters, and batch greeting. Invoke whenever the user requests any job search or recruitment platform interaction on BOSS 直聘.
 author: jackwener
-version: "0.3.0"
+version: "0.3.6"
 tags:
   - boss
   - zhipin
@@ -15,7 +15,7 @@ tags:
 # boss-cli — BOSS 直聘 CLI Tool
 
 **Binary:** `boss`
-**Credentials:** browser cookies (auto-extracted from 10+ browsers) or QR code login (`--qrcode`)
+**Credentials:** persistent Chrome CDP login (`--cdp`, recommended), browser cookies, QR code login, or encrypted full `.bossconfig` transfer packages
 
 ## Setup
 
@@ -48,6 +48,7 @@ Ensure user is logged into zhipin.com in any supported browser (Chrome, Firefox,
 
 ```bash
 boss login                              # auto-detect browser with valid cookies
+boss login --cdp                        # recommended persistent isolated Chrome session
 boss login --cookie-source chrome       # specify browser explicitly
 boss login --qrcode                     # QR code login — scan with Boss app
 ```
@@ -113,8 +114,12 @@ Payloads live under `.data`.
 | Command | Description |
 |---------|-------------|
 | `boss login` | Extract cookies from browser (auto-detect, fallback QR) |
+| `boss login --cdp` | Open/reuse an isolated Chrome profile and capture live session cookies |
 | `boss login --cookie-source <browser>` | Extract from specific browser |
 | `boss login --qrcode` | QR code login only (terminal QR output) |
+| `boss config-export <file>` | Export credentials and all portable plugin settings as encrypted `.bossconfig` |
+| `boss config-import <file> --verify` | Atomically import and verify full configuration on another host |
+| `boss credential-export/import` | Backward-compatible aliases; old credential-only `.bosscred` packages remain importable |
 | `boss status` | Check authentication status (shows cookie names) |
 | `boss logout` | Clear saved credentials |
 

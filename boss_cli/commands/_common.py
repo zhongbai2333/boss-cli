@@ -49,8 +49,8 @@ def run_client_action(credential: Credential, action: Callable[[BossClient], T])
             return action(client)
     except SessionExpiredError:
         # Try refreshing from browser
-        from ..auth import clear_credential, extract_browser_credential
-        fresh, _ = extract_browser_credential()
+        from ..auth import clear_credential, refresh_credential
+        fresh, _ = refresh_credential()
         if fresh:
             with get_client(fresh) as client:
                 return action(client)

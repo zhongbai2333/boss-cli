@@ -27,9 +27,9 @@ import qrcode
 from boss_cli.constants import (
     AUTH_HEALTH_CACHE_TTL_S,
     BASE_URL,
-    CONFIG_DIR,
     CREDENTIAL_FILE,
     HEADERS,
+    is_zhipin_cookie_domain,
     REQUIRED_COOKIES,
     QR_CODE_URL,
     QR_DISPATCHER_URL,
@@ -37,6 +37,7 @@ from boss_cli.constants import (
     QR_SCAN_LOGIN_URL,
     QR_SCAN_URL,
 )
+from boss_cli.io_utils import atomic_write_private
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +85,8 @@ class Credential:
 
 def save_credential(credential: Credential) -> None:
     """Save credential to config file."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CREDENTIAL_FILE.write_text(json.dumps(credential.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-    CREDENTIAL_FILE.chmod(0o600)
+    atomic_write_private(CREDENTIAL_FILE, json.dumps(credential.to_dict(), indent=2, ensure_ascii=False))
+    _AUTH_HEALTH_CACHE.clear()
     logger.info("Credential saved to %s", CREDENTIAL_FILE)
 
 
@@ -124,7 +124,7 @@ def load_credential() -> Credential | None:
                 "Credential older than %d days, attempting browser refresh",
                 CREDENTIAL_TTL_DAYS,
             )
-            fresh, _ = extract_browser_credential()
+            fresh, _ = refresh_credential()
             if fresh:
                 logger.info("Auto-refreshed credential from browser")
                 return fresh
@@ -290,7 +290,7 @@ def _extract_cookies_from_jar(jar: Any, source: str = "unknown") -> dict[str, st
     cookies: dict[str, str] = {}
     for cookie in jar:
         domain = cookie.domain or ""
-        if "zhipin.com" in domain:
+        if is_zhipin_cookie_domain(domain):
             if cookie.name and cookie.value:
                 cookies[cookie.name] = cookie.value
     if cookies:
@@ -411,6 +411,10 @@ CHROMIUM_BASE_DIRS = {
     "brave": os.path.join("BraveSoftware", "Brave-Browser"),
 }
 
+def is_zhipin_domain(domain):
+    normalized = (domain or "").strip().lstrip(".").lower()
+    return normalized == "zhipin.com" or normalized.endswith(".zhipin.com")
+
 def iter_cookie_files(browser_name):
     base_dir = CHROMIUM_BASE_DIRS.get(browser_name)
     if base_dir is None:
@@ -464,7 +468,7 @@ for name, loader in browsers:
         if not cookie_files:
             try:
                 cj = loader(domain_name=".zhipin.com")
-                cookies = {c.name: c.value for c in cj if "zhipin.com" in (c.domain or "")}
+                cookies = {c.name: c.value for c in cj if is_zhipin_domain(c.domain)}
                 if cookies:
                     print(json.dumps({"browser": name, "cookies": cookies}))
                     sys.exit(0)
@@ -476,7 +480,7 @@ for name, loader in browsers:
             pname = os.path.basename(os.path.dirname(cf))
             try:
                 cj = loader(cookie_file=cf, domain_name=".zhipin.com")
-                cookies = {c.name: c.value for c in cj if "zhipin.com" in (c.domain or "")}
+                cookies = {c.name: c.value for c in cj if is_zhipin_domain(c.domain)}
                 if cookies:
                     print(json.dumps({"browser": name, "cookies": cookies}))
                     sys.exit(0)
@@ -486,7 +490,7 @@ for name, loader in browsers:
     else:
         try:
             cj = loader(domain_name=".zhipin.com")
-            cookies = {c.name: c.value for c in cj if "zhipin.com" in (c.domain or "")}
+            cookies = {c.name: c.value for c in cj if is_zhipin_domain(c.domain)}
             if cookies:
                 print(json.dumps({"browser": name, "cookies": cookies}))
                 sys.exit(0)
@@ -591,6 +595,26 @@ def extract_browser_credential(cookie_source: str | None = None) -> tuple[Creden
     if not cred:
         logger.warning("Cookie extraction failed in both in-process and subprocess modes")
     return None, all_diagnostics
+
+
+def refresh_credential(cookie_source: str | None = None) -> tuple[Credential | None, list[str]]:
+    """Refresh from a live CDP Chrome first, then browser cookie databases."""
+    diagnostics: list[str] = []
+    try:
+        from .cdp_login import CDPLoginUnavailable, extract_cdp_credential
+
+        credential = extract_cdp_credential()
+        if credential and credential.has_required_cookies:
+            save_credential(credential)
+            logger.info("Refreshed credential from live Chrome CDP session")
+            return credential, diagnostics
+    except (CDPLoginUnavailable, OSError, ValueError, RuntimeError) as exc:
+        diagnostics.append(f"cdp: {exc}")
+        logger.debug("Live CDP credential refresh failed: %s", exc)
+
+    credential, browser_diagnostics = extract_browser_credential(cookie_source)
+    diagnostics.extend(browser_diagnostics)
+    return credential, diagnostics
 
 
 # ── QR Code terminal rendering ──────────────────────────────────────
@@ -888,7 +912,7 @@ def get_credential() -> Credential | None:
         save_credential(cred)
         return cred
 
-    cred, _ = extract_browser_credential()
+    cred, _ = refresh_credential()
     if cred:
         logger.info("Extracted credential from browser")
         return cred

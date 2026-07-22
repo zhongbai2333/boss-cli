@@ -24,6 +24,7 @@ dependencies = [
     "uvicorn>=0.34",
     "lxml>=5.3",
     "python-dotenv>=1.0",
+    "cryptography>=44.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,9 @@ yaml = [
 ]
 browser = [
     "camoufox>=0.4",
+]
+cdp = [
+    "websocket-client>=1.8",
 ]
 
 [project.urls]

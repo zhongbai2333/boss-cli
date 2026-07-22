@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html as html_stdlib
 import json
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
@@ -79,7 +80,7 @@ def test_parse_public_jobs_hidden_json_and_local_keyword_filter():
   assert parse_public_jobs(source, keyword="Python", limit=5) == []
 
 
-def test_public_client_scans_bounded_pages_until_limit(monkeypatch):
+def test_public_client_scans_bounded_pages_until_limit(monkeypatch, tmp_path):
     requested_pages = []
 
     class Response:
@@ -113,26 +114,108 @@ def test_public_client_scans_bounded_pages_until_limit(monkeypatch):
     monkeypatch.setattr("boss_cli.public_jobs.httpx.Client", Client)
     monkeypatch.setattr(PublicJobsClient, "_wait_for_slot", lambda self: None)
 
-    jobs = PublicJobsClient().search("Python", page=3, limit=2, scan_pages=99)
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    jobs = PublicJobsClient(cache=SQLiteCache(tmp_path / "cache.db")).search(
+      "Python", page=3, limit=2, scan_pages=99,
+    )
 
     assert requested_pages == [3, 4]
     assert [job["id"] for job in jobs] == ["3", "4"]
 
 
+def test_public_client_reuses_cache_for_smaller_limit(monkeypatch, tmp_path):
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    requested_pages = []
+
+    class Response:
+      def __init__(self):
+        records = [
+          {"acb200": index, "aca112": f"Python {index}", "aab004": "测试公司"}
+          for index in range(1, 4)
+        ]
+        payload = html_stdlib.escape(json.dumps(records, ensure_ascii=False), quote=True)
+        self.text = f'<input id="findjoblist" value="{payload}">'
+
+      def raise_for_status(self):
+        return None
+
+    class Client:
+      def __init__(self, **kwargs):
+        pass
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return None
+
+      def get(self, url, *, params):
+        requested_pages.append(params["pageNo"])
+        return Response()
+
+    monkeypatch.setenv("MOHRSS_AUTHORIZED", "true")
+    monkeypatch.setattr("boss_cli.public_jobs.httpx.Client", Client)
+    monkeypatch.setattr(PublicJobsClient, "_wait_for_slot", lambda self: None)
+    client = PublicJobsClient(cache=SQLiteCache(tmp_path / "cache.db"))
+
+    assert len(client.search("Python", page=1, limit=3)) == 3
+    assert len(client.search("Python", page=1, limit=2)) == 2
+    assert requested_pages == [1]
+
+
+def test_public_and_boss_cache_namespaces_are_isolated(tmp_path):
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    cache = SQLiteCache(tmp_path / "cache.db")
+    cache.set("source:boss:api-get", "same-key", {"source": "boss"}, ttl_s=60)
+    cache.set("source:public:jobs", "same-key", {"source": "public"}, ttl_s=60)
+
+    assert cache.get("source:boss:api-get", "same-key") == {"source": "boss"}
+    assert cache.get("source:public:jobs", "same-key") == {"source": "public"}
+
+
 def test_plugin_requires_configured_api_key(monkeypatch):
-    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
-    client = TestClient(app)
-    response = client.post("/api/v1/jobs/search", json={"keyword": "Python", "source": "boss"})
-    assert response.status_code == 401
+  monkeypatch.setenv("PLUGIN_API_KEY", "expected")
+  client = TestClient(app)
+  response = client.post("/api/v1/jobs/search", json={"keyword": "Python", "source": "boss"})
+  assert response.status_code == 401
+
+
+def test_plugin_fails_closed_without_api_key(monkeypatch):
+    monkeypatch.delenv("PLUGIN_API_KEY", raising=False)
+    monkeypatch.delenv("PLUGIN_ALLOW_ANONYMOUS", raising=False)
+
+    response = TestClient(app).post(
+      "/api/v1/jobs/search",
+      json={"keyword": "Python", "source": "public"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_plugin_allows_explicit_anonymous_development_mode(monkeypatch):
+    monkeypatch.delenv("PLUGIN_API_KEY", raising=False)
+    monkeypatch.setenv("PLUGIN_ALLOW_ANONYMOUS", "true")
+    monkeypatch.setattr("boss_cli.plugin_api.PublicJobsClient.search", lambda self, *args, **kwargs: [])
+
+    response = TestClient(app).post(
+      "/api/v1/jobs/search",
+      json={"keyword": "Python", "source": "public"},
+    )
+
+    assert response.status_code == 200
 
 
 def test_plugin_returns_public_results(monkeypatch):
-    monkeypatch.delenv("PLUGIN_API_KEY", raising=False)
+    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
     expected = parse_public_jobs(PUBLIC_HTML, keyword="采购")
     monkeypatch.setattr("boss_cli.plugin_api.PublicJobsClient.search", lambda self, *args, **kwargs: expected)
 
     response = TestClient(app).post(
         "/api/v1/jobs/search",
+      headers={"X-Plugin-Key": "expected"},
         json={"keyword": "采购", "city": "黄冈", "source": "public", "limit": 5},
     )
     assert response.status_code == 200
@@ -144,7 +227,7 @@ def test_plugin_returns_public_results(monkeypatch):
 
 
 def test_plugin_keeps_successful_source_when_other_fails(monkeypatch):
-    monkeypatch.delenv("PLUGIN_API_KEY", raising=False)
+    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
     expected = parse_public_jobs(PUBLIC_HTML, keyword="采购")
     monkeypatch.setattr("boss_cli.plugin_api.search_boss_jobs", lambda *args, **kwargs: expected)
 
@@ -154,7 +237,7 @@ def test_plugin_keeps_successful_source_when_other_fails(monkeypatch):
     monkeypatch.setattr("boss_cli.plugin_api.PublicJobsClient.search", fail_public)
     response = TestClient(app).post(
         "/api/v1/jobs/search",
-        headers={"X-Plugin-Key": "ignored"},
+        headers={"X-Plugin-Key": "expected"},
         json={"keyword": "采购", "source": "all"},
     )
     data = response.json()
@@ -165,6 +248,37 @@ def test_plugin_keeps_successful_source_when_other_fails(monkeypatch):
     assert data["errors"][0]["source"] == "public"
 
 
+def test_plugin_applies_source_specific_semantic_plans(monkeypatch):
+    from boss_cli.semantic_cache import SemanticQueryPlan
+
+    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
+    planner = MagicMock()
+    planner.plan.side_effect = [
+      SemanticQueryPlan("boss", "后端工程师", "Python 后端开发", 0.98, True),
+      SemanticQueryPlan("public", "后端工程师", "计算机软件开发", 0.96, True),
+    ]
+    monkeypatch.setattr("boss_cli.plugin_api.SemanticQueryPlanner.from_env", lambda: planner)
+    boss_search = MagicMock(return_value=[])
+    public_search = MagicMock(return_value=[])
+    monkeypatch.setattr("boss_cli.plugin_api.search_boss_jobs", boss_search)
+    monkeypatch.setattr("boss_cli.plugin_api.PublicJobsClient.search", public_search)
+
+    response = TestClient(app).post(
+      "/api/v1/jobs/search",
+      headers={"X-Plugin-Key": "expected"},
+      json={"keyword": "后端工程师", "city": "北京", "source": "all", "page": 2, "limit": 5},
+    )
+
+    assert response.status_code == 200
+    boss_search.assert_called_once_with("后端工程师", "北京", 2, 5, cache_keyword="Python 后端开发")
+    assert public_search.call_args.args[0] == "后端工程师"
+    assert public_search.call_args.kwargs["cache_keyword"] == "计算机软件开发"
+    assert public_search.call_args.kwargs["city"] == "北京"
+    assert public_search.call_args.kwargs["page"] == 2
+    assert public_search.call_args.kwargs["limit"] == 5
+    assert [call.args[0] for call in planner.plan.call_args_list] == ["boss", "public"]
+
+
 def test_openapi_exposes_single_astron_action():
     schema = TestClient(app).get("/openapi.json").json()
     action = schema["paths"]["/api/v1/jobs/search"]["post"]
@@ -172,3 +286,42 @@ def test_openapi_exposes_single_astron_action():
     assert "/health" in schema["paths"]
     request_schema = schema["components"]["schemas"]["JobSearchRequest"]
     assert request_schema["properties"]["public_scan_pages"]["maximum"] == 5
+
+
+def test_boss_plugin_uses_protective_cache_and_throttle(monkeypatch):
+    from boss_cli.auth import Credential
+    from boss_cli.job_sources import search_boss_jobs
+
+    credential = Credential(cookies={"wt2": "account"})
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.search_jobs.return_value = {"jobList": []}
+    constructor = MagicMock(return_value=client)
+    monkeypatch.setattr("boss_cli.job_sources.get_credential", lambda: credential)
+    monkeypatch.setattr("boss_cli.job_sources.BossClient", constructor)
+    monkeypatch.setenv("BOSS_PLUGIN_CACHE_TTL_S", "1800")
+    monkeypatch.setenv("BOSS_PLUGIN_MIN_INTERVAL_S", "10")
+
+    search_boss_jobs("Python", "北京", 1, 10)
+
+    assert constructor.call_args.kwargs["cache_ttl_s"] == 1800
+    assert constructor.call_args.kwargs["min_request_interval_s"] == 10
+
+
+def test_boss_plugin_rejects_dangerously_low_throttle(monkeypatch):
+    from boss_cli.auth import Credential
+    from boss_cli.job_sources import search_boss_jobs
+
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.search_jobs.return_value = {"jobList": []}
+    constructor = MagicMock(return_value=client)
+    monkeypatch.setattr("boss_cli.job_sources.get_credential", lambda: Credential(cookies={"wt2": "account"}))
+    monkeypatch.setattr("boss_cli.job_sources.BossClient", constructor)
+    monkeypatch.setenv("BOSS_PLUGIN_CACHE_TTL_S", "0")
+    monkeypatch.setenv("BOSS_PLUGIN_MIN_INTERVAL_S", "0")
+
+    search_boss_jobs("Python", "北京", 1, 10)
+
+    assert constructor.call_args.kwargs["cache_ttl_s"] == 60
+    assert constructor.call_args.kwargs["min_request_interval_s"] == 5

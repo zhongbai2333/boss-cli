@@ -32,4 +32,5 @@ htmlcov/
 
 # Config (DO NOT commit credentials)
 credential.json
+*.bosscred
 .env

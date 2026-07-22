@@ -39,6 +39,10 @@ cli.add_command(auth.login)
 cli.add_command(auth.logout)
 cli.add_command(auth.status)
 cli.add_command(auth.me)
+cli.add_command(auth.config_export)
+cli.add_command(auth.config_import)
+cli.add_command(auth.credential_export, "credential-export")
+cli.add_command(auth.credential_import, "credential-import")
 
 # ─── Search & Browse commands ────────────────────────────────────────
 

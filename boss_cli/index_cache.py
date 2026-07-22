@@ -3,7 +3,7 @@
 Stores the last search/recommend result set so that users can quickly
 access a job by its 1-based index number (e.g., `boss show 3`).
 
-Cache file: ~/.config/boss-cli/index_cache.json
+Cache database: ~/.config/boss-cli/cache.db
 """
 
 from __future__ import annotations
@@ -13,11 +13,38 @@ import logging
 import time
 from typing import Any
 
-from .constants import CONFIG_DIR
+from .constants import CACHE_DB_FILE, CONFIG_DIR, INDEX_CACHE_TTL_S
+from .sqlite_cache import SQLiteCache
 
 logger = logging.getLogger(__name__)
 
 INDEX_CACHE_FILE = CONFIG_DIR / "index_cache.json"
+INDEX_CACHE_DB_FILE = CACHE_DB_FILE
+INDEX_NAMESPACE = "job-index"
+INDEX_KEY = "current"
+
+
+def _cache() -> SQLiteCache:
+    return SQLiteCache(INDEX_CACHE_DB_FILE)
+
+
+def _migrate_legacy_cache() -> None:
+    """Import the previous JSON index once, preserving its original age."""
+    if not INDEX_CACHE_FILE.exists():
+        return
+    try:
+        data = json.loads(INDEX_CACHE_FILE.read_text(encoding="utf-8"))
+        saved_at = float(data.get("saved_at", 0))
+        remaining_ttl = saved_at + INDEX_CACHE_TTL_S - time.time()
+        if isinstance(data.get("items"), list) and remaining_ttl > 0:
+            _cache().set(INDEX_NAMESPACE, INDEX_KEY, data, ttl_s=remaining_ttl)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        logger.warning("Unable to migrate legacy index cache", exc_info=True)
+    finally:
+        try:
+            INDEX_CACHE_FILE.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Unable to remove legacy index cache", exc_info=True)
 
 
 def save_index(jobs: list[dict[str, Any]], source: str = "search") -> None:
@@ -28,8 +55,6 @@ def save_index(jobs: list[dict[str, Any]], source: str = "search") -> None:
     """
     if not jobs:
         return
-
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     entries = []
     for job in jobs:
@@ -48,15 +73,14 @@ def save_index(jobs: list[dict[str, Any]], source: str = "search") -> None:
         if entry["securityId"]:
             entries.append(entry)
 
-    payload = {
+    payload: dict[str, Any] = {
         "source": source,
         "saved_at": time.time(),
         "count": len(entries),
         "items": entries,
     }
 
-    INDEX_CACHE_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    INDEX_CACHE_FILE.chmod(0o600)
+    _cache().set(INDEX_NAMESPACE, INDEX_KEY, payload, ttl_s=INDEX_CACHE_TTL_S)
     logger.debug("Saved index cache with %d entries from %s", len(entries), source)
 
 
@@ -68,33 +92,28 @@ def get_job_by_index(index: int) -> dict[str, Any] | None:
     if index <= 0:
         return None
 
-    if not INDEX_CACHE_FILE.exists():
-        return None
-
-    try:
-        data = json.loads(INDEX_CACHE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    _migrate_legacy_cache()
+    data = _cache().get(INDEX_NAMESPACE, INDEX_KEY)
+    if not isinstance(data, dict):
         return None
 
     items = data.get("items", [])
-    if index > len(items):
+    if not isinstance(items, list) or index > len(items):
         return None
 
-    return items[index - 1]
+    item = items[index - 1]
+    return item if isinstance(item, dict) else None
 
 
 def get_index_info() -> dict[str, Any]:
     """Get metadata about the current index cache."""
-    if not INDEX_CACHE_FILE.exists():
+    _migrate_legacy_cache()
+    data = _cache().get(INDEX_NAMESPACE, INDEX_KEY)
+    if not isinstance(data, dict):
         return {"exists": False, "count": 0}
-
-    try:
-        data = json.loads(INDEX_CACHE_FILE.read_text(encoding="utf-8"))
-        return {
-            "exists": True,
-            "source": data.get("source", "unknown"),
-            "count": data.get("count", 0),
-            "saved_at": data.get("saved_at", 0),
-        }
-    except (OSError, json.JSONDecodeError):
-        return {"exists": False, "count": 0}
+    return {
+        "exists": True,
+        "source": data.get("source", "unknown"),
+        "count": data.get("count", 0),
+        "saved_at": data.get("saved_at", 0),
+    }

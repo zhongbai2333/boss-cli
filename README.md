@@ -10,9 +10,9 @@ A CLI for BOSS 直聘 — search jobs, view recommendations, manage applications
 
 ## 讯飞星辰 Agent Plugin
 
-本分支提供可部署的 HTTP 自定义插件，将 BOSS 直聘与经授权的中国公共招聘网岗位统一为 Agent 可调用的数据结构。它通过星辰平台的“资源管理 → 自定义插件”接入，不是 MCP 服务。
+本分支提供可部署的 HTTP 自定义插件，将 BOSS 直聘与经授权的中国公共招聘网岗位统一为 Agent 可调用的数据结构。它通过星辰平台的“资源管理 → 自定义插件”接入，不是 MCP 服务。各数据平台共享 SQLite 缓存基础设施，但使用独立命名空间、TTL、授权规则与跨进程限流闸门。可选 LLM 语义层只生成平台内缓存别名，不改变实际查询参数，用于提高 Agent 改写问题后的缓存命中率。
 
-部署、鉴权、合规边界和参数配置请参阅 [`ASTRON_PLUGIN.md`](./ASTRON_PLUGIN.md)。
+部署、鉴权、合规边界和参数配置请参阅 [`ASTRON_PLUGIN.md`](./ASTRON_PLUGIN.md)。插件默认仅监听 `127.0.0.1`，且未配置 `PLUGIN_API_KEY` 时拒绝业务请求；匿名模式只应通过 `PLUGIN_ALLOW_ANONYMOUS=true` 用于本机开发。
 
 ## More Tools
 
@@ -74,6 +74,9 @@ uv sync
 boss login                             # Auto-detect browser cookies, fallback to QR
 boss login --cookie-source chrome      # Extract from specific browser
 boss login --qrcode                    # QR code login only
+boss login --cdp                       # Recommended: persistent isolated Chrome session
+boss config-export boss-cloud.bossconfig       # Export login + complete plugin configuration
+boss config-import boss-cloud.bossconfig       # Import on another host/server
 boss status                            # Check login status (validates real search session, shows cookie names)
 boss logout                            # Clear saved cookies
 
@@ -214,8 +217,44 @@ boss-cli supports multiple authentication methods:
 1. **Saved cookies** — loads from `~/.config/boss-cli/credential.json`
 2. **Browser cookies** — auto-detects installed browsers (Chrome, Firefox, Edge, Brave, Arc, Chromium, Opera, Vivaldi, Safari, LibreWolf)
 3. **QR code login** — terminal QR output using Unicode half-blocks, scan with Boss 直聘 APP
+4. **Persistent Chrome CDP (recommended)** — `boss login --cdp` opens an isolated, visible Chrome profile and exports the live `zhipin.com` cookie jar, including JS-generated tokens
 
 `boss login` auto-extracts browser cookies first, falls back to QR login. Use `--cookie-source chrome` to specify a browser, or `--qrcode` to skip browser detection. The command now verifies the saved credential against a real authenticated API before reporting success.
+
+For the most reliable login state, install the optional CDP dependency and use the persistent browser flow:
+
+```bash
+pip install 'kabi-boss-cli[cdp]'
+boss login --cdp
+```
+
+The dedicated profile is stored at `~/.config/boss-cli/chrome-profile`. It is never copied from your main Chrome profile and Chrome stays open after login so the site can rotate cookies and maintain its own session. Later refreshes prefer this live CDP cookie jar before reading browser cookie databases. API `Set-Cookie` updates are also written back to `credential.json`.
+
+### Move a local login to a server
+
+After logging in locally, export an encrypted credential package and transfer that file to the server:
+
+```bash
+# Local machine: refresh the live browser session and export it
+boss login --cdp
+boss config-export boss-cloud.bossconfig
+
+# Server: import, then check whether the session is accepted from this network
+boss config-import boss-cloud.bossconfig --verify
+boss status
+```
+
+The command asks for the package password with hidden input. The package uses Scrypt plus AES-256-GCM; cookie names and values are not stored in plaintext, and a wrong password or modified package is rejected. Keep the package and password in separate channels and delete the transferred file after import.
+
+For non-interactive deployment, provide the password through an environment variable rather than a command-line argument:
+
+```bash
+# Set BOSS_CREDENTIAL_PASSPHRASE in your secret manager/runtime environment first
+boss config-export boss-cloud.bossconfig --force
+boss config-import boss-cloud.bossconfig --force --verify
+```
+
+Use `--passphrase-env OTHER_VARIABLE` to choose another variable name. `--verify` is optional because some cloud egress IPs may temporarily trigger BOSS risk control; when enabled, a failed verification restores the previous server credential automatically.
 
 `boss recommend` follows the live web app's current recommendation data source and request context, which improves compatibility when the legacy recommendation endpoint is rejected.
 
@@ -273,7 +312,9 @@ boss_cli/
 ├── auth.py               # Authentication (10+ browsers, QR login, TTL refresh)
 ├── constants.py          # URLs, headers (Chrome 145), city codes, filter enums
 ├── exceptions.py         # Structured exceptions (BossApiError hierarchy)
-├── index_cache.py        # Short-index cache for `boss show`
+├── sqlite_cache.py       # SQLite TTL cache and cross-process safety throttle
+├── semantic_cache.py     # Optional source-aware LLM semantic cache aliases
+├── index_cache.py        # SQLite-backed short-index cache for `boss show`
 └── commands/
     ├── _common.py        # SCHEMA envelope, handle_command, stderr console
     ├── auth.py           # login (--cookie-source/--qrcode), logout, status, me
@@ -341,6 +382,9 @@ Check your city filter. Some keywords are city-specific. Use `boss cities` to se
 # 认证
 boss login                             # 自动提取浏览器 Cookie，失败则二维码
 boss login --cookie-source chrome      # 指定浏览器
+boss login --cdp                       # 推荐：持久隔离 Chrome，复用实时登录态
+boss config-export boss-cloud.bossconfig       # 加密导出登录态和完整插件配置
+boss config-import boss-cloud.bossconfig       # 在云端一键导入并持久化
 boss status                            # 检查登录状态
 boss logout                            # 清除 Cookie
 

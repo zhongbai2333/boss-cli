@@ -2,6 +2,23 @@ services:
   job-plugin:
     build: .
     env_file: .env
+    environment:
+      BOSS_PLUGIN_CACHE_TTL_S: ${BOSS_PLUGIN_CACHE_TTL_S:-1800}
+      BOSS_PLUGIN_MIN_INTERVAL_S: ${BOSS_PLUGIN_MIN_INTERVAL_S:-10}
+      PUBLIC_PLUGIN_CACHE_TTL_S: ${PUBLIC_PLUGIN_CACHE_TTL_S:-1800}
+      PUBLIC_PLUGIN_MIN_INTERVAL_S: ${PUBLIC_PLUGIN_MIN_INTERVAL_S:-2}
+      LLM_SEMANTIC_CACHE_ENABLED: ${LLM_SEMANTIC_CACHE_ENABLED:-false}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_SEMANTIC_CONFIDENCE: ${LLM_SEMANTIC_CONFIDENCE:-0.92}
+      LLM_SEMANTIC_ALIAS_TTL_S: ${LLM_SEMANTIC_ALIAS_TTL_S:-604800}
+      LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-5}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - boss-cli-config:/root/.config/boss-cli
     restart: unless-stopped
+
+volumes:
+  boss-cli-config:

@@ -34,6 +34,7 @@ from .constants import (
     BOSS_SEND_MSG_URL,
     BOSS_SESSION_ENTER_URL,
     BOSS_VIEW_GEEK_URL,
+    API_CACHE_TTL_S,
     CITY_CODES,
     DELIVER_LIST_URL,
     FRIEND_ADD_URL,
@@ -56,6 +57,7 @@ from .constants import (
     WEB_GEEK_RECOMMEND_URL,
 )
 from .exceptions import BossApiError, ParamError, RateLimitError, SessionExpiredError
+from .sqlite_cache import SQLiteCache, credential_cache_scope, make_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +79,19 @@ class BossClient:
         timeout: float = 30.0,
         request_delay: float = 1.0,
         max_retries: int = 3,
+        cache: SQLiteCache | None = None,
+        cache_ttl_s: float = API_CACHE_TTL_S,
+        min_request_interval_s: float = 0.0,
     ):
         self.credential = credential
         self._timeout = timeout
         self._request_delay = request_delay
         self._base_request_delay = request_delay
         self._max_retries = max_retries
+        self._cache = cache or SQLiteCache()
+        self._cache_ttl_s = cache_ttl_s
+        self._cache_scope = credential_cache_scope(credential)
+        self._min_request_interval_s = max(0.0, min_request_interval_s)
         self._last_request_time = 0.0
         self._request_count = 0
         self._rate_limit_count = 0
@@ -171,9 +180,20 @@ class BossClient:
 
     def _merge_response_cookies(self, resp: httpx.Response) -> None:
         """Persist response Set-Cookie headers back into the session jar."""
+        changed = False
         for name, value in resp.cookies.items():
             if value:
                 self.client.cookies.set(name, value)
+                if self.credential is not None and self.credential.cookies.get(name) != value:
+                    self.credential.cookies[name] = value
+                    changed = True
+            elif self.credential is not None and name in self.credential.cookies:
+                self.credential.cookies.pop(name)
+                changed = True
+        if changed:
+            from .auth import save_credential
+
+            save_credential(self.credential)
 
     def _headers_for_request(self, url: str, params: dict[str, Any] | None = None) -> dict[str, str]:
         """Build browser-like headers, including endpoint-specific Referer and zp_token."""
@@ -215,10 +235,17 @@ class BossClient:
 
     def _handle_response(self, data: dict[str, Any], action: str) -> dict[str, Any]:
         """Validate API response and return zpData, raise typed exceptions."""
+        if not isinstance(data, dict):
+            raise BossApiError(f"{action}: 接口响应格式异常（顶层不是 JSON 对象）")
         code = data.get("code", -1)
 
         if code == 0:
-            return data.get("zpData", {})
+            result = data.get("zpData", {})
+            if result is None:
+                return {}
+            if not isinstance(result, (dict, list)):
+                raise BossApiError(f"{action}: 接口响应格式异常（zpData 类型错误）")
+            return result
 
         message = data.get("message", "Unknown error")
 
@@ -259,7 +286,9 @@ class BossClient:
         if request_headers:
             merged_headers.update(request_headers)
 
-        for attempt in range(self._max_retries):
+        method = method.upper()
+        max_attempts = self._max_retries if method in {"GET", "HEAD", "OPTIONS"} else 1
+        for attempt in range(max_attempts):
             t0 = time.time()
             try:
                 resp = self.client.request(method, url, headers=merged_headers, **kwargs)
@@ -275,12 +304,14 @@ class BossClient:
                 # Retry on server errors
                 if resp.status_code in (429, 500, 502, 503, 504):
                     wait = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(
-                        "HTTP %d from %s, retrying in %.1fs (attempt %d/%d)",
-                        resp.status_code, url[:80], wait, attempt + 1, self._max_retries,
-                    )
-                    time.sleep(wait)
-                    continue
+                    if attempt + 1 < max_attempts:
+                        logger.warning(
+                            "HTTP %d from %s, retrying in %.1fs (attempt %d/%d)",
+                            resp.status_code, url[:80], wait, attempt + 1, max_attempts,
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise BossApiError(f"HTTP {resp.status_code} from {url}", code=resp.status_code)
 
                 # For non-server errors (4xx except 404), raise immediately
                 if resp.status_code == 404:
@@ -294,33 +325,71 @@ class BossClient:
 
                 # Check for HTML responses (redirect to login page)
                 text = resp.text
-                if text.startswith("<"):
+                if text.lstrip("\ufeff \t\r\n").startswith("<"):
                     raise BossApiError(f"Received HTML instead of JSON from {url} (possible auth redirect)")
 
-                return resp.json()
+                try:
+                    data = resp.json()
+                except ValueError as exc:
+                    raise BossApiError(f"Invalid JSON response from {url}") from exc
+                if not isinstance(data, dict):
+                    raise BossApiError(f"Invalid JSON object response from {url}")
+                return data
 
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 elapsed = time.time() - t0
                 last_exc = exc
                 wait = (2 ** attempt) + random.uniform(0, 1)
-                logger.warning(
-                    "[#%d] %s %s → Network error: %s (%.2fs), retrying in %.1fs (attempt %d/%d)",
-                    self._request_count + 1, method, url[:60], exc, elapsed, wait,
-                    attempt + 1, self._max_retries,
-                )
-                time.sleep(wait)
+                if attempt + 1 < max_attempts:
+                    logger.warning(
+                        "[#%d] %s %s → Network error: %s (%.2fs), retrying in %.1fs (attempt %d/%d)",
+                        self._request_count + 1, method, url[:60], exc, elapsed, wait,
+                        attempt + 1, max_attempts,
+                    )
+                    time.sleep(wait)
 
         if last_exc:
-            raise BossApiError(f"Request failed after {self._max_retries} retries: {last_exc}") from last_exc
-        raise BossApiError(f"Request failed after {self._max_retries} retries")
+            raise BossApiError(f"Request failed after {max_attempts} attempt(s): {last_exc}") from last_exc
+        raise BossApiError(f"Request failed after {max_attempts} attempt(s)")
 
-    def _get(self, url: str, params: dict[str, Any] | None = None, action: str = "") -> dict[str, Any]:
-        """GET request with response validation and rate-limit retry."""
+    def _get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        action: str = "",
+        *,
+        use_cache: bool = True,
+        cache_params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a fresh cached GET result first, otherwise request and cache it."""
+        cache_key = make_cache_key(self._cache_scope, url, cache_params if cache_params is not None else (params or {}))
+        if use_cache and self._cache_ttl_s > 0:
+            cached = self._cache.get("source:boss:api-get", cache_key)
+            if isinstance(cached, (dict, list)):
+                logger.debug("SQLite cache hit for %s", url)
+                return cached
+
+        if self._min_request_interval_s > 0:
+            wait_s = self._cache.reserve_request_slot(
+                f"boss-api:{self._cache_scope}",
+                min_interval_s=self._min_request_interval_s,
+            )
+            if wait_s > 0:
+                logger.info("BOSS account safety throttle: waiting %.1fs before upstream request", wait_s)
+                time.sleep(wait_s)
+                if use_cache and self._cache_ttl_s > 0:
+                    cached = self._cache.get("source:boss:api-get", cache_key)
+                    if isinstance(cached, (dict, list)):
+                        logger.debug("SQLite cache filled while waiting for %s", url)
+                        return cached
+
         data = self._request("GET", url, params=params)
         try:
             result = self._handle_response(data, action)
             # Reset rate-limit counter on success
             self._rate_limit_count = 0
+            if use_cache and self._cache_ttl_s > 0:
+                self._cache.set("source:boss:api-get", cache_key, result, ttl_s=self._cache_ttl_s)
             return result
         except RateLimitError:
             # Auto-retry once after cooldown (cooldown already happened in _handle_response)
@@ -328,6 +397,8 @@ class BossClient:
             data = self._request("GET", url, params=params)
             result = self._handle_response(data, action)
             self._rate_limit_count = 0
+            if use_cache and self._cache_ttl_s > 0:
+                self._cache.set("source:boss:api-get", cache_key, result, ttl_s=self._cache_ttl_s)
             return result
 
     # ── Job Search & Browse ─────────────────────────────────────────
@@ -345,6 +416,7 @@ class BossClient:
         scale: str | None = None,
         stage: str | None = None,
         job_type: str | None = None,
+        cache_query: str | None = None,
     ) -> dict[str, Any]:
         """Search jobs."""
         params: dict[str, Any] = {
@@ -367,7 +439,10 @@ class BossClient:
             params["stage"] = stage
         if job_type:
             params["jobType"] = job_type
-        return self._get(JOB_SEARCH_URL, params=params, action="搜索职位")
+        cache_params = dict(params)
+        if cache_query:
+            cache_params["query"] = cache_query
+        return self._get(JOB_SEARCH_URL, params=params, cache_params=cache_params, action="搜索职位")
 
     def get_recommend_jobs(self, page: int = 1) -> dict[str, Any]:
         """Get personalized job recommendations.
@@ -448,7 +523,7 @@ class BossClient:
         params: dict[str, str] = {"securityId": security_id}
         if lid:
             params["lid"] = lid
-        return self._get(FRIEND_ADD_URL, params=params, action="打招呼")
+        return self._get(FRIEND_ADD_URL, params=params, action="打招呼", use_cache=False)
 
     def get_geek_job(self, security_id: str) -> dict[str, Any]:
         """Get interacted job info."""
@@ -465,11 +540,8 @@ class BossClient:
             self._rate_limit_count = 0
             return result
         except RateLimitError:
-            logger.info("Retrying after rate-limit cooldown...")
-            resp = self._request("POST", url, **kwargs)
-            result = self._handle_response(resp, action)
-            self._rate_limit_count = 0
-            return result
+            logger.warning("POST was rate limited; not retrying a potentially non-idempotent operation")
+            raise
 
     def get_boss_chatted_jobs(self) -> list[dict[str, Any]]:
         """Get list of jobs the boss has posted (chatted job list)."""

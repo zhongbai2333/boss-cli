@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ntpath
 import os
 import platform
 import shutil
@@ -41,10 +42,10 @@ def find_chrome_executable() -> str | None:
             os.environ.get("PROGRAMFILES(X86)"),
         ):
             if base:
-                candidates.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
+                candidates.append(ntpath.join(base, "Google", "Chrome", "Application", "chrome.exe"))
         edge_base = os.environ.get("PROGRAMFILES(X86)") or os.environ.get("PROGRAMFILES")
         if edge_base:
-            candidates.append(os.path.join(edge_base, "Microsoft", "Edge", "Application", "msedge.exe"))
+            candidates.append(ntpath.join(edge_base, "Microsoft", "Edge", "Application", "msedge.exe"))
     elif system == "Darwin":
         candidates.extend((
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",

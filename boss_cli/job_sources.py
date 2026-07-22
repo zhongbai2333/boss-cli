@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal
+
+from typing_extensions import TypedDict
 
 from .auth import get_credential
 from .client import BossClient, resolve_city

@@ -58,6 +58,7 @@ def test_collect_settings_uses_whitelist_and_environment_priority(tmp_path, monk
     persistent_env.write_text("PLUGIN_PORT=8000\nLLM_MODEL=from-file\n", encoding="utf-8")
     monkeypatch.setenv("PLUGIN_PORT", "9000")
     monkeypatch.setenv("LLM_API_KEY", "runtime-secret")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
 
     settings = collect_portable_settings(
         project_env_file=project_env,

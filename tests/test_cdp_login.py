@@ -12,6 +12,7 @@ def test_find_chrome_executable_windows(monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\test\AppData\Local")
     expected = r"C:\Users\test\AppData\Local\Google\Chrome\Application\chrome.exe"
     monkeypatch.setattr(cdp_login.os.path, "isfile", lambda path: path == expected)
+    monkeypatch.setattr(cdp_login.shutil, "which", lambda name: None)
 
     assert cdp_login.find_chrome_executable() == expected
 

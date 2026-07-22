@@ -25,8 +25,12 @@ class TestCliBasic:
         assert "0." in result.output
 
     def test_runtime_version_matches_project_metadata(self):
-        import tomllib
         from pathlib import Path
+
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import tomli as tomllib
 
         from boss_cli import __version__
 

@@ -25,12 +25,14 @@ dependencies = [
     "lxml>=5.3",
     "python-dotenv>=1.0",
     "cryptography>=44.0",
+    "typing-extensions>=4.12",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.11.0",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 yaml = [
     "pyyaml>=6.0",

@@ -236,13 +236,14 @@ class TestRefreshCredential:
         from boss_cli.auth import Credential, refresh_credential
 
         cred = Credential({"__zp_stoken__": "s", "wt2": "1", "wbg": "2", "zp_at": "3"})
-        with patch("boss_cli.cdp_login.extract_cdp_credential", return_value=cred), \
+        with patch("boss_cli.cdp_login.extract_cdp_credential", return_value=cred) as cdp_extract, \
              patch("boss_cli.auth.extract_browser_credential") as browser_extract, \
              patch("boss_cli.auth.save_credential") as save:
             result, diagnostics = refresh_credential()
 
         assert result is cred
         assert diagnostics == []
+        cdp_extract.assert_called_once_with(endpoint=None)
         browser_extract.assert_not_called()
         save.assert_called_once_with(cred)
 
@@ -257,4 +258,21 @@ class TestRefreshCredential:
 
         assert result is fresh
         assert diagnostics == ["browser ok"]
+
+    def test_sidecar_injects_current_credential(self, monkeypatch):
+        from boss_cli.auth import Credential, refresh_credential
+
+        current = Credential({"__zp_stoken__": "old", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        fresh = Credential({"__zp_stoken__": "new", "wt2": "1", "wbg": "2", "zp_at": "3"})
+        monkeypatch.setenv("BOSS_CDP_ENDPOINT", "http://chromium:9222")
+        with patch("boss_cli.cdp_login.refresh_cdp_credential", return_value=fresh) as cdp_refresh, \
+             patch("boss_cli.auth.extract_browser_credential") as browser_extract, \
+             patch("boss_cli.auth.save_credential") as save:
+            result, diagnostics = refresh_credential(current_credential=current)
+
+        assert result is fresh
+        assert diagnostics == []
+        cdp_refresh.assert_called_once_with(current, endpoint="http://chromium:9222")
+        browser_extract.assert_not_called()
+        save.assert_called_once_with(fresh)
 """Tests for boss_cli.auth — diagnostics, env fallback, and extraction."""

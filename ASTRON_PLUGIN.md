@@ -137,6 +137,20 @@ LLM_TIMEOUT_S=5
 
 生产环境应配置 `PLUGIN_API_KEY`、使用 HTTPS 反向代理，并只向星辰平台开放插件地址。不要将 `.env`、Cookie 或 API Key 提交到 Git。
 
+### Chromium 自动补全动态令牌
+
+Compose 部署包含一个仅 Docker 内网可访问的 `chromium` Sidecar。它没有宿主机端口映射，也不会加载 `.env` 或挂载插件凭据目录；独立命名卷仅保存专用浏览器 Profile。
+
+当 BOSS 搜索明确返回 `code=37` 时，插件会执行一次受控恢复：
+
+1. 清理专用浏览器上下文中的旧 BOSS Cookie；
+2. 注入当前会话 Cookie，但不注入已失效的 `__zp_stoken__`；
+3. 打开一次 BOSS 用户页面，让浏览器 JavaScript 尝试生成新令牌；
+4. 导出同一浏览器上下文的完整 Cookie，成功后只重放一次幂等搜索；
+5. 若失败，沿用凭据指纹冷却，后续请求不会反复启动恢复或撞击 BOSS 上游。
+
+CDP 地址默认为 `http://chromium:9223`，只允许回环、私网 IP 或固定 Sidecar 服务名，不得发布 CDP 端口到公网。Debian Chromium 自身只在容器 loopback 的 `9222` 监听，容器内 `socat` 将 Compose 私网的 `9223` 转发至该 loopback 端口。Sidecar 保持非 root、只读文件系统和独立 Profile，并使用 Debian Chromium 自带的 sandbox；没有使用 `--no-sandbox` 或 `privileged`。由于 Docker 默认能力集无法创建 Chromium sandbox 所需 namespace，Sidecar 额外授予 `SYS_ADMIN`，因此它必须继续保持仅两个受信容器可达的私有网络边界。验证码、手机确认、`code=121/122` 安全拦截及非幂等操作均不会自动重试；这些场景仍需人工登录，届时可再启用受 SSH 隧道保护的 VNC 方案。
+
 ## 星辰平台配置
 
 在星辰 Agent 开发平台进入 **资源管理 → 自定义插件 → 新建插件**：
@@ -144,8 +158,10 @@ LLM_TIMEOUT_S=5
 1. 基本信息：名称可填写“招聘双来源搜索”，描述说明支持 BOSS 与中国公共招聘网。
 2. 请求方式选择 `POST`，URL 填写 `https://你的域名/api/v1/jobs/search`。
 3. 授权方式选择 `Service`，密钥传入位置选择 `Header`：
-   - 参数名：`X-Plugin-Key`
+   - 参数名：`X_Plugin_Key`（星辰参数名只允许字母、数字和下划线）。
    - 参数值：与服务端 `PLUGIN_API_KEY` 一致。
+
+插件同时兼容标准 HTTP 请求头 `X-Plugin-Key`，便于其他客户端调用。若一次请求同时携带两种请求头且值不同，插件会拒绝该请求，避免代理层请求头歧义。
 4. 请求 Body 按 `/openapi.json` 中的 `JobSearchRequest` 配置：
    - `keyword`（string，必填）：职位关键词。
    - `city`（string）：城市/地区，默认“全国”。

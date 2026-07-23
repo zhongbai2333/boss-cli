@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import html as html_stdlib
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from boss_cli.plugin_api import app
@@ -183,6 +185,31 @@ def test_plugin_requires_configured_api_key(monkeypatch):
   assert response.status_code == 401
 
 
+def test_plugin_accepts_astron_compatible_underscore_header(monkeypatch):
+    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
+    monkeypatch.setattr("boss_cli.plugin_api.search_boss_jobs", lambda *args, **kwargs: [])
+
+    response = TestClient(app).post(
+      "/api/v1/jobs/search",
+      headers={"X_Plugin_Key": "expected"},
+      json={"keyword": "Python", "source": "boss"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_plugin_rejects_conflicting_auth_headers(monkeypatch):
+    monkeypatch.setenv("PLUGIN_API_KEY", "expected")
+
+    response = TestClient(app).post(
+      "/api/v1/jobs/search",
+      headers={"X-Plugin-Key": "expected", "X_Plugin_Key": "different"},
+      json={"keyword": "Python", "source": "boss"},
+    )
+
+    assert response.status_code == 401
+
+
 def test_plugin_fails_closed_without_api_key(monkeypatch):
     monkeypatch.delenv("PLUGIN_API_KEY", raising=False)
     monkeypatch.delenv("PLUGIN_ALLOW_ANONYMOUS", raising=False)
@@ -325,3 +352,103 @@ def test_boss_plugin_rejects_dangerously_low_throttle(monkeypatch):
 
     assert constructor.call_args.kwargs["cache_ttl_s"] == 60
     assert constructor.call_args.kwargs["min_request_interval_s"] == 5
+
+
+def test_boss_plugin_refreshes_once_after_session_expiry(monkeypatch, tmp_path):
+    from boss_cli.auth import Credential
+    from boss_cli.exceptions import SessionExpiredError
+    from boss_cli.job_sources import search_boss_jobs
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    stale = Credential(cookies={"wt2": "account", "__zp_stoken__": "stale"})
+    fresh = Credential(cookies={"wt2": "account", "__zp_stoken__": "fresh"})
+    stale_client = MagicMock()
+    stale_client.__enter__.return_value = stale_client
+    stale_client.search_jobs.side_effect = SessionExpiredError()
+    fresh_client = MagicMock()
+    fresh_client.__enter__.return_value = fresh_client
+    fresh_client.search_jobs.return_value = {"jobList": []}
+    constructor = MagicMock(side_effect=[stale_client, fresh_client])
+    refresh = MagicMock(return_value=(fresh, []))
+
+    monkeypatch.setattr("boss_cli.job_sources.get_credential", lambda: stale)
+    monkeypatch.setattr("boss_cli.job_sources.refresh_credential", refresh)
+    monkeypatch.setattr("boss_cli.job_sources.SQLiteCache", lambda: SQLiteCache(tmp_path / "cache.db"))
+    monkeypatch.setattr("boss_cli.job_sources.BossClient", constructor)
+
+    assert search_boss_jobs("Python", "北京", 1, 3) == []
+    assert constructor.call_count == 2
+    refresh.assert_called_once_with(current_credential=stale)
+
+
+def test_boss_plugin_cools_down_expired_credential_without_more_requests(monkeypatch, tmp_path):
+    from boss_cli.auth import Credential
+    from boss_cli.exceptions import SessionExpiredError
+    from boss_cli.job_sources import search_boss_jobs
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    stale = Credential(cookies={"wt2": "account", "__zp_stoken__": "stale"})
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.search_jobs.side_effect = SessionExpiredError()
+    constructor = MagicMock(return_value=client)
+    refresh = MagicMock(return_value=(None, ["browser unavailable"]))
+    cache = SQLiteCache(tmp_path / "cache.db")
+
+    monkeypatch.setattr("boss_cli.job_sources.get_credential", lambda: stale)
+    monkeypatch.setattr("boss_cli.job_sources.refresh_credential", refresh)
+    monkeypatch.setattr("boss_cli.job_sources.SQLiteCache", lambda: cache)
+    monkeypatch.setattr("boss_cli.job_sources.BossClient", constructor)
+
+    with pytest.raises(SessionExpiredError):
+        search_boss_jobs("Python", "北京", 1, 3)
+    with pytest.raises(SessionExpiredError):
+        search_boss_jobs("Java", "上海", 1, 3)
+
+    assert constructor.call_count == 1
+    refresh.assert_called_once_with(current_credential=stale)
+
+
+def test_boss_plugin_does_not_refresh_non_authentication_failure(monkeypatch, tmp_path):
+    from boss_cli.auth import Credential
+    from boss_cli.exceptions import BossApiError
+    from boss_cli.job_sources import search_boss_jobs
+    from boss_cli.sqlite_cache import SQLiteCache
+
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.search_jobs.side_effect = BossApiError("blocked", code=121)
+    refresh = MagicMock()
+
+    monkeypatch.setattr(
+        "boss_cli.job_sources.get_credential",
+        lambda: Credential(cookies={"wt2": "account", "__zp_stoken__": "token"}),
+    )
+    monkeypatch.setattr("boss_cli.job_sources.refresh_credential", refresh)
+    monkeypatch.setattr("boss_cli.job_sources.SQLiteCache", lambda: SQLiteCache(tmp_path / "cache.db"))
+    monkeypatch.setattr("boss_cli.job_sources.BossClient", MagicMock(return_value=client))
+
+    with pytest.raises(BossApiError):
+        search_boss_jobs("Python", "北京", 1, 3)
+    refresh.assert_not_called()
+
+
+def test_chromium_sidecar_is_private_and_has_no_secrets():
+    compose = (Path(__file__).parents[1] / "compose.yaml").read_text(encoding="utf-8")
+    chromium = compose.split("\n  chromium:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+
+    assert "expose:\n      - \"9223\"" in chromium
+    assert "ports:" not in chromium
+    assert "env_file:" not in chromium
+    assert "boss-cli-config" not in chromium
+    assert "cap_add:\n      - SYS_ADMIN" in chromium
+    assert "privileged: true" not in chromium
+
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile.chromium").read_text(encoding="utf-8")
+    assert "chromium-sandbox" in dockerfile
+    assert "socat" in dockerfile
+    assert "--no-sandbox" not in dockerfile
+
+    entrypoint = (Path(__file__).parents[1] / "chromium-entrypoint.sh").read_text(encoding="utf-8")
+    assert "SingletonLock" in entrypoint
+    assert "rm -rf" not in entrypoint

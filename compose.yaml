@@ -5,6 +5,8 @@ services:
     environment:
       BOSS_PLUGIN_CACHE_TTL_S: ${BOSS_PLUGIN_CACHE_TTL_S:-1800}
       BOSS_PLUGIN_MIN_INTERVAL_S: ${BOSS_PLUGIN_MIN_INTERVAL_S:-10}
+      BOSS_PLUGIN_AUTH_FAILURE_COOLDOWN_S: ${BOSS_PLUGIN_AUTH_FAILURE_COOLDOWN_S:-3600}
+      BOSS_CDP_ENDPOINT: http://chromium:9223
       PUBLIC_PLUGIN_CACHE_TTL_S: ${PUBLIC_PLUGIN_CACHE_TTL_S:-1800}
       PUBLIC_PLUGIN_MIN_INTERVAL_S: ${PUBLIC_PLUGIN_MIN_INTERVAL_S:-2}
       LLM_SEMANTIC_CACHE_ENABLED: ${LLM_SEMANTIC_CACHE_ENABLED:-false}
@@ -18,7 +20,36 @@ services:
       - "127.0.0.1:8000:8000"
     volumes:
       - boss-cli-config:/root/.config/boss-cli
+    depends_on:
+      chromium:
+        condition: service_healthy
+    restart: unless-stopped
+
+  chromium:
+    build:
+      context: .
+      dockerfile: Dockerfile.chromium
+    expose:
+      - "9223"
+    volumes:
+      - boss-cli-chromium-profile:/home/chromium/profile
+    init: true
+    shm_size: 512m
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/chromium/.cache:uid=10001,gid=10001,mode=0700
+      - /home/chromium/.config:uid=10001,gid=10001,mode=0700
+    cap_add:
+      - SYS_ADMIN
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9223/json/version', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
 volumes:
   boss-cli-config:
+  boss-cli-chromium-profile:

@@ -9,15 +9,18 @@ dependencies installed.
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import ntpath
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -65,16 +68,58 @@ def find_chrome_executable() -> str | None:
     return shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chrome")
 
 
-def _version_url(port: int) -> str:
-    return f"http://127.0.0.1:{port}/json/version"
-
-
-def is_cdp_ready(port: int = DEFAULT_CDP_PORT) -> bool:
-    """Return whether a local CDP endpoint is reachable."""
+def _cdp_endpoint(port: int = DEFAULT_CDP_PORT, endpoint: str | None = None) -> str:
+    raw = (endpoint or os.environ.get("BOSS_CDP_ENDPOINT") or f"http://127.0.0.1:{port}").strip().rstrip("/")
+    parsed = urlsplit(raw)
+    if parsed.scheme != "http" or not parsed.hostname or parsed.username or parsed.password:
+        raise CDPLoginUnavailable("CDP endpoint 必须是无凭据的内网 HTTP 地址")
+    if parsed.path or parsed.query or parsed.fragment:
+        raise CDPLoginUnavailable("CDP endpoint 不得包含路径、查询参数或片段")
+    hostname = parsed.hostname.lower()
+    allowed_names = {"localhost", "chromium"}
     try:
-        response = httpx.get(_version_url(port), timeout=1.5)
+        address = ipaddress.ip_address(hostname)
+        allowed = address.is_loopback or address.is_private
+    except ValueError:
+        allowed = hostname in allowed_names
+    if not allowed:
+        raise CDPLoginUnavailable("拒绝连接公网或未授权的 CDP 主机")
+    return raw
+
+
+def _version_url(port: int = DEFAULT_CDP_PORT, endpoint: str | None = None) -> str:
+    return f"{_transport_endpoint(port, endpoint)}/json/version"
+
+
+def _transport_endpoint(port: int = DEFAULT_CDP_PORT, endpoint: str | None = None) -> str:
+    """Resolve the trusted sidecar name so Chromium receives an IP Host header."""
+    trusted = urlsplit(_cdp_endpoint(port, endpoint))
+    hostname = trusted.hostname or ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        if hostname == "localhost":
+            resolved = "127.0.0.1"
+        else:
+            try:
+                resolved = socket.gethostbyname(hostname)
+            except OSError as exc:
+                raise CDPLoginUnavailable("无法解析 CDP 内网主机") from exc
+        address = ipaddress.ip_address(resolved)
+    if not (address.is_loopback or address.is_private):
+        raise CDPLoginUnavailable("CDP 服务名解析到了非私网地址")
+    netloc = f"[{address}]" if address.version == 6 else str(address)
+    if trusted.port:
+        netloc = f"{netloc}:{trusted.port}"
+    return urlunsplit((trusted.scheme, netloc, "", "", ""))
+
+
+def is_cdp_ready(port: int = DEFAULT_CDP_PORT, *, endpoint: str | None = None) -> bool:
+    """Return whether a trusted local/private CDP endpoint is reachable."""
+    try:
+        response = httpx.get(_version_url(port, endpoint), timeout=1.5)
         return response.status_code == 200 and bool(response.json().get("webSocketDebuggerUrl"))
-    except (httpx.HTTPError, ValueError):
+    except (CDPLoginUnavailable, httpx.HTTPError, ValueError):
         return False
 
 
@@ -128,7 +173,7 @@ def launch_cdp_chrome(
 
 
 class _CDPConnection:
-    def __init__(self, port: int):
+    def __init__(self, port: int = DEFAULT_CDP_PORT, *, endpoint: str | None = None):
         try:
             import websocket
         except ImportError as exc:
@@ -137,15 +182,23 @@ class _CDPConnection:
             ) from exc
 
         try:
-            data = httpx.get(_version_url(port), timeout=5).json()
-            ws_url = data["webSocketDebuggerUrl"]
+            trusted_endpoint = urlsplit(_cdp_endpoint(port, endpoint))
+            transport_endpoint = urlsplit(_transport_endpoint(port, endpoint))
+            data = httpx.get(_version_url(port, endpoint), timeout=5).json()
+            advertised = urlsplit(data["webSocketDebuggerUrl"])
+            if advertised.scheme not in {"ws", "wss"} or not advertised.path.startswith("/devtools/browser/"):
+                raise ValueError("invalid browser WebSocket URL")
+            ws_scheme = "wss" if trusted_endpoint.scheme == "https" else "ws"
+            ws_url = urlunsplit((ws_scheme, transport_endpoint.netloc, advertised.path, advertised.query, ""))
+            origin_host = trusted_endpoint.hostname or "127.0.0.1"
+            origin = f"http://{origin_host}"
             self._ws = websocket.create_connection(
                 ws_url,
                 timeout=10,
-                origin="http://127.0.0.1",
+                origin=origin,
             )
         except Exception as exc:
-            raise CDPLoginUnavailable(f"无法连接本机 Chrome CDP 端口 {port}: {exc}") from exc
+            raise CDPLoginUnavailable(f"无法连接 Chrome CDP: {type(exc).__name__}") from exc
         self._message_id = 0
 
     def send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -166,16 +219,7 @@ class _CDPConnection:
         self._ws.close()
 
 
-def extract_cdp_credential(port: int = DEFAULT_CDP_PORT) -> Credential | None:
-    """Export the live zhipin.com cookie jar from a running Chrome."""
-    if not is_cdp_ready(port):
-        return None
-    connection = _CDPConnection(port)
-    try:
-        entries = connection.send("Storage.getCookies").get("cookies", [])
-    finally:
-        connection.close()
-
+def _credential_from_entries(entries: list[dict[str, Any]]) -> Credential | None:
     cookies: dict[str, str] = {}
     for entry in entries:
         domain = str(entry.get("domain") or "")
@@ -184,6 +228,62 @@ def extract_cdp_credential(port: int = DEFAULT_CDP_PORT) -> Credential | None:
         if is_zhipin_cookie_domain(domain) and isinstance(name, str) and isinstance(value, str) and value:
             cookies[name] = value
     return Credential(cookies) if cookies else None
+
+
+def extract_cdp_credential(
+    port: int = DEFAULT_CDP_PORT,
+    *,
+    endpoint: str | None = None,
+) -> Credential | None:
+    """Export the live zhipin.com cookie jar from a running Chrome."""
+    if not is_cdp_ready(port, endpoint=endpoint):
+        return None
+    connection = _CDPConnection(port, endpoint=endpoint)
+    try:
+        entries = connection.send("Storage.getCookies").get("cookies", [])
+    finally:
+        connection.close()
+    return _credential_from_entries(entries)
+
+
+def refresh_cdp_credential(
+    credential: Credential,
+    *,
+    endpoint: str | None = None,
+    timeout: float = 20.0,
+) -> Credential | None:
+    """Inject a session into a private Chromium and let page JS replace stoken."""
+    if not is_cdp_ready(endpoint=endpoint):
+        return None
+    connection = _CDPConnection(endpoint=endpoint)
+    target_id: str | None = None
+    try:
+        connection.send("Storage.clearCookies")
+        injected = [
+            {"name": name, "value": value, "url": f"{BASE_URL}/"}
+            for name, value in credential.cookies.items()
+            if name != "__zp_stoken__" and value
+        ]
+        if not injected:
+            return None
+        connection.send("Storage.setCookies", {"cookies": injected})
+        target_id = connection.send("Target.createTarget", {"url": f"{BASE_URL}/web/user/"}).get("targetId")
+
+        deadline = time.monotonic() + max(1.0, timeout)
+        while time.monotonic() < deadline:
+            entries = connection.send("Storage.getCookies").get("cookies", [])
+            refreshed = _credential_from_entries(entries)
+            if refreshed and refreshed.has_required_cookies:
+                return refreshed
+            time.sleep(1)
+        return None
+    finally:
+        if target_id:
+            try:
+                connection.send("Target.closeTarget", {"targetId": target_id})
+            except CDPLoginUnavailable:
+                logger.debug("Unable to close temporary CDP target")
+        connection.close()
 
 
 def cdp_login(

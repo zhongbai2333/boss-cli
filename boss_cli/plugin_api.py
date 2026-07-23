@@ -64,7 +64,10 @@ app = FastAPI(
 )
 
 
-def verify_plugin_key(x_plugin_key: str | None = Header(default=None)) -> None:
+def verify_plugin_key(
+    x_plugin_key: str | None = Header(default=None, alias="X-Plugin-Key"),
+    x_plugin_key_underscore: str | None = Header(default=None, alias="X_Plugin_Key"),
+) -> None:
     """Use Astron Service/Header authentication when a key is configured."""
     expected = os.environ.get("PLUGIN_API_KEY", "")
     allow_anonymous = os.environ.get("PLUGIN_ALLOW_ANONYMOUS", "").strip().lower() in {"1", "true", "yes"}
@@ -72,7 +75,10 @@ def verify_plugin_key(x_plugin_key: str | None = Header(default=None)) -> None:
         if allow_anonymous:
             return
         raise HTTPException(status_code=503, detail="Plugin API key is not configured")
-    if x_plugin_key is None or not hmac.compare_digest(x_plugin_key, expected):
+    if x_plugin_key is not None and x_plugin_key_underscore is not None and x_plugin_key != x_plugin_key_underscore:
+        raise HTTPException(status_code=401, detail="Conflicting plugin API keys")
+    supplied = x_plugin_key if x_plugin_key is not None else x_plugin_key_underscore
+    if supplied is None or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=401, detail="Invalid plugin API key")
 
 

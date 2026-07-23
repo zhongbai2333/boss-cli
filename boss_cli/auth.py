@@ -597,13 +597,22 @@ def extract_browser_credential(cookie_source: str | None = None) -> tuple[Creden
     return None, all_diagnostics
 
 
-def refresh_credential(cookie_source: str | None = None) -> tuple[Credential | None, list[str]]:
+def refresh_credential(
+    cookie_source: str | None = None,
+    *,
+    current_credential: Credential | None = None,
+) -> tuple[Credential | None, list[str]]:
     """Refresh from a live CDP Chrome first, then browser cookie databases."""
     diagnostics: list[str] = []
     try:
-        from .cdp_login import CDPLoginUnavailable, extract_cdp_credential
+        from .cdp_login import CDPLoginUnavailable, extract_cdp_credential, refresh_cdp_credential
 
-        credential = extract_cdp_credential()
+        endpoint = os.environ.get("BOSS_CDP_ENDPOINT")
+        credential = (
+            refresh_cdp_credential(current_credential, endpoint=endpoint)
+            if current_credential is not None and endpoint
+            else extract_cdp_credential(endpoint=endpoint)
+        )
         if credential and credential.has_required_cookies:
             save_credential(credential)
             logger.info("Refreshed credential from live Chrome CDP session")
